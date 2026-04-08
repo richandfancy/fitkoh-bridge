@@ -9,17 +9,17 @@ import type { ClockClient } from './clock'
 const MOCK_GUESTS = [
   {
     title: 'Mr.',
-    first: 'Klaus',
-    last: 'Mueller',
-    phone: '+49 170 1234567',
-    email: 'k.mueller@gmail.com',
+    first: 'Michael',
+    last: 'Grillhoesl',
+    phone: '+49 175 5871286',
+    email: 'michaelgrillhoesl@gmail.com',
   },
   {
-    title: 'Ms.',
-    first: 'Emma',
-    last: 'Thompson',
-    phone: '+44 7700 900123',
-    email: 'emma.thompson@outlook.com',
+    title: 'Mr.',
+    first: 'Chris',
+    last: 'Heid',
+    phone: '+49 170 1234567',
+    email: 'heidca@gmail.com',
   },
   {
     title: 'Mr.',
@@ -257,10 +257,20 @@ export class MockClockClient implements ClockClient {
 }
 
 export async function seedDatabase(db: D1Database): Promise<void> {
+  // Clear existing data for a fresh seed
+  await db.batch([
+    db.prepare('DELETE FROM synced_transactions'),
+    db.prepare('DELETE FROM activity_log'),
+    db.prepare('DELETE FROM dead_letters'),
+    db.prepare('DELETE FROM bookings'),
+  ])
+
   // Insert mock bookings (some with poster_client_id, some without)
   const bookingInserts = MOCK_BOOKINGS.map((b, i) => {
-    // First 4 bookings have poster_client_id set; last 3 are unlinked
-    const posterClientId = i < 4 ? 1000 + i : null
+    // First 4 bookings linked to Poster clients; last 3 unlinked
+    // Use real Poster client IDs for the first two to demo real meal data
+    const realPosterIds = [2512, 2495, 1002, 1003] // Michael Grillhoesl, Chris Heid, mock, mock
+    const posterClientId = i < 4 ? realPosterIds[i] : null
     return db
       .prepare(
         `INSERT OR IGNORE INTO bookings
