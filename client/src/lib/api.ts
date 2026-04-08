@@ -1,0 +1,35 @@
+class ApiError extends Error {
+  constructor(public status: number, message: string) {
+    super(message)
+  }
+}
+
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const resp = await fetch(path, {
+    ...options,
+    credentials: 'same-origin',
+    headers: {
+      'Content-Type': 'application/json',
+      ...options?.headers,
+    },
+  })
+
+  if (resp.status === 401) {
+    // Trigger re-auth
+    window.dispatchEvent(new CustomEvent('auth:logout'))
+    throw new ApiError(401, 'Unauthorized')
+  }
+
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({ error: 'Unknown error' })) as { error?: string }
+    throw new ApiError(resp.status, body.error || `HTTP ${resp.status}`)
+  }
+
+  return resp.json() as Promise<T>
+}
+
+export const api = {
+  get: <T>(path: string) => request<T>(path),
+  post: <T>(path: string, body?: unknown) => request<T>(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined }),
+  put: <T>(path: string, body?: unknown) => request<T>(path, { method: 'PUT', body: body ? JSON.stringify(body) : undefined }),
+}

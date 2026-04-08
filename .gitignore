@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.env*
+.firecrawl/
+*.local
+.DS_Store

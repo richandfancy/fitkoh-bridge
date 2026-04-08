@@ -1,0 +1,24 @@
+# FitKoh System Bridge
+> Dashboard for bridging FitKoh systems via Cloudflare Pages + Functions
+
+**Path:** `~/Apps/fitkoh-system-bridge`
+**Status:** Active
+**Stack:** React 19, Vite 7, Tailwind v4, Hono, Cloudflare Pages/Functions, D1, KV, wouter, zod
+**URLs:** TBD (not yet deployed)
+
+## What This Is
+A Cloudflare Pages + Functions project that serves as a system bridge dashboard for FitKoh. The frontend is React with Tailwind v4 and wouter routing, served as a SPA. The backend is a Hono API running as Cloudflare Workers with D1 (SQLite) and KV storage bindings.
+
+## Key Decisions
+- Cloudflare Pages + Functions (not Railway) for edge deployment
+- Hono over itty-router for API layer (consistent with other CF projects)
+- wouter over react-router for lightweight client routing
+- D1 for structured data, KV for configuration
+- Vite dev server proxies /api/* to local wrangler on port 8787
+
+## Session Log
+| Date | Summary |
+|------|---------|
+| 2026-04-07 | Project design: brainstormed architecture, explored Clock PMS + Poster POS APIs, verified Poster token works, wrote full spec. BAC-786. |
+| 2026-04-07 | Poster API exploration: tested all endpoints, mapped 154 Poster products to FitKoh menu items, created 46 new menu items + 13 supplement serving items with product photos. Imported 353 meal logs for Michael + 414 for Chris via new REST import endpoint. |
+| 2026-04-08 | Full implementation: scaffold, worker foundation (env, auth, D1 migration, queries), service layer (real Poster client, mock Clock with European guests, notifications, guest-sync, invoice-transfer), all API routes (webhooks, admin, dashboard, pre-invoice, guest meals), client foundation (auth, floating nav, login), all 6 dashboard pages (Activity, Guests, GuestDetail, DeadLetters, Settings, PreInvoice). tsc passes clean. |
