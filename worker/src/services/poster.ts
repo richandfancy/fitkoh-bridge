@@ -115,6 +115,7 @@ export class PosterClient {
     dateTo: string,
   ): Promise<PosterTransaction[]> {
     const allTxns = await this.getTransactions(dateFrom, dateTo)
+    if (!allTxns || !Array.isArray(allTxns)) return []
     return allTxns.filter((t) => t.client_id === String(clientId))
   }
 }
