@@ -1,223 +1,164 @@
-import { useState, useEffect } from 'react'
-import { ShoppingBag, Loader2, RefreshCw, ChevronDown, ChevronUp } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import { ShoppingBag, RefreshCw } from 'lucide-react'
 import { api } from '@/lib/api'
 import { cn, formatCurrency } from '@/lib/utils'
 import { Skeleton } from '@/components/Skeleton'
 import { EmptyState } from '@/components/EmptyState'
 
-interface Order {
-  transactionId: string
-  status: 'open' | 'closed'
-  table: string
-  location: string
-  clientId: number | null
-  clientName: string | null
-  total: number
-  openedAt: string | null
-  closedAt: string | null
-}
-
-interface OrdersResponse {
-  date: string
-  total: number
-  open: number
-  closed: number
-  orders: Order[]
-}
-
-interface OrderItem {
-  productId: string
-  name: string
+interface LiveItem {
+  id: string
+  time: string
+  productId: number
+  productName: string
   quantity: number
-  unitPrice: number
-}
-
-interface OrderDetail {
-  transactionId: string
-  status: 'open' | 'closed'
-  table: string
+  price: number
+  table: number
   location: string
   clientName: string | null
-  total: number
-  items: OrderItem[]
+  transactionId: number
 }
 
-function formatTime(iso: string | null): string {
-  if (!iso) return '—'
-  const d = new Date(iso)
-  return d.toLocaleTimeString('en-GB', {
-    hour: '2-digit',
-    minute: '2-digit',
-    timeZone: 'Asia/Bangkok',
-  })
+interface FeedResponse {
+  date: string
+  totalItems: number
+  openOrders: number
+  closedOrders: number
+  items: LiveItem[]
 }
 
-function OrderRow({ order }: { order: Order }) {
-  const [expanded, setExpanded] = useState(false)
-  const [detail, setDetail] = useState<OrderDetail | null>(null)
-  const [loadingDetail, setLoadingDetail] = useState(false)
+function formatTime(dateStr: string): string {
+  if (!dateStr) return '—'
+  // Poster date format: "2026-04-10 12:00:20"
+  const parts = dateStr.split(' ')
+  if (parts.length !== 2) return dateStr
+  return parts[1].substring(0, 5) // HH:MM
+}
 
-  const toggle = async () => {
-    if (!expanded && !detail) {
-      setLoadingDetail(true)
-      try {
-        const d = await api.get<OrderDetail>(`/api/dashboard/orders/${order.transactionId}`)
-        setDetail(d)
-      } catch {
-        // silently fail
-      } finally {
-        setLoadingDetail(false)
-      }
-    }
-    setExpanded(!expanded)
-  }
+function formatRelative(dateStr: string): string {
+  if (!dateStr) return ''
+  const d = new Date(dateStr.replace(' ', 'T') + '+07:00')
+  const now = new Date()
+  const diffMs = now.getTime() - d.getTime()
+  const diffSec = Math.floor(diffMs / 1000)
+  const diffMin = Math.floor(diffMs / 60000)
+  const diffHr = Math.floor(diffMs / 3600000)
 
-  const isOpen = order.status === 'open'
-
-  return (
-    <div
-      className={cn(
-        'bg-card border rounded-xl overflow-hidden animate-fade-in',
-        isOpen ? 'border-status-amber/30' : 'border-border',
-      )}
-    >
-      <button
-        onClick={toggle}
-        className="w-full p-4 flex items-center gap-3 hover:bg-secondary/30 transition-colors text-left"
-      >
-        {/* Status indicator */}
-        <div className="flex flex-col items-center shrink-0">
-          <div
-            className={cn(
-              'w-2.5 h-2.5 rounded-full',
-              isOpen ? 'bg-status-amber animate-pulse' : 'bg-status-green',
-            )}
-          />
-        </div>
-
-        {/* Main info */}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-sm font-semibold text-foreground">
-              Table {order.table}
-            </span>
-            <span className="text-xs text-muted-foreground">·</span>
-            <span className="text-xs text-muted-foreground truncate">
-              {order.location}
-            </span>
-          </div>
-          <div className="text-xs text-muted-foreground mt-0.5 truncate">
-            {order.clientName || 'Walk-in'}
-            {order.openedAt && <> · opened {formatTime(order.openedAt)}</>}
-            {order.closedAt && <> · closed {formatTime(order.closedAt)}</>}
-          </div>
-        </div>
-
-        {/* Total + chevron */}
-        <div className="flex items-center gap-2 shrink-0">
-          <div className="text-right">
-            <div className="text-sm font-semibold text-foreground">
-              {formatCurrency(order.total)}
-            </div>
-            <div
-              className={cn(
-                'text-[10px] font-medium uppercase tracking-wide',
-                isOpen ? 'text-status-amber' : 'text-status-green',
-              )}
-            >
-              {isOpen ? 'Open' : 'Closed'}
-            </div>
-          </div>
-          {expanded ? (
-            <ChevronUp size={16} className="text-muted-foreground" />
-          ) : (
-            <ChevronDown size={16} className="text-muted-foreground" />
-          )}
-        </div>
-      </button>
-
-      {/* Expanded detail */}
-      {expanded && (
-        <div className="border-t border-border px-4 py-3 bg-background/40">
-          {loadingDetail ? (
-            <div className="flex items-center justify-center py-4">
-              <Loader2 size={16} className="animate-spin text-muted-foreground" />
-            </div>
-          ) : detail && detail.items.length > 0 ? (
-            <div className="space-y-1">
-              {detail.items.map((item, i) => (
-                <div
-                  key={i}
-                  className="flex items-center justify-between text-xs py-1"
-                >
-                  <span className="text-foreground">
-                    {item.quantity > 1 && (
-                      <span className="text-muted-foreground">
-                        {item.quantity}× {' '}
-                      </span>
-                    )}
-                    {item.name}
-                  </span>
-                  <span className="text-muted-foreground tabular-nums">
-                    {formatCurrency(item.unitPrice * item.quantity)}
-                  </span>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <p className="text-xs text-muted-foreground text-center py-2">
-              No line items
-            </p>
-          )}
-        </div>
-      )}
-    </div>
-  )
+  if (diffSec < 60) return 'just now'
+  if (diffMin < 60) return `${diffMin}m ago`
+  if (diffHr < 24) return `${diffHr}h ago`
+  return formatTime(dateStr)
 }
 
 export function OrdersPage() {
-  const [data, setData] = useState<OrdersResponse | null>(null)
+  const [data, setData] = useState<FeedResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [locationFilter, setLocationFilter] = useState<string>('all')
+  const seenIds = useRef<Set<string>>(new Set())
+  const [newIds, setNewIds] = useState<Set<string>>(new Set())
 
-  const fetchOrders = async () => {
+  const fetchFeed = async () => {
     try {
-      const result = await api.get<OrdersResponse>('/api/dashboard/orders')
+      const result = await api.get<FeedResponse>('/api/dashboard/orders')
+
+      // Detect new items since last fetch
+      const currentNewIds = new Set<string>()
+      if (seenIds.current.size > 0) {
+        for (const item of result.items) {
+          if (!seenIds.current.has(item.id)) {
+            currentNewIds.add(item.id)
+          }
+        }
+      }
+
+      // Update seen set
+      seenIds.current = new Set(result.items.map((i) => i.id))
+
       setData(result)
+      setNewIds(currentNewIds)
       setError(null)
+
+      // Clear new highlight after 3 seconds
+      if (currentNewIds.size > 0) {
+        setTimeout(() => setNewIds(new Set()), 3000)
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load orders')
+      setError(err instanceof Error ? err.message : 'Failed to load items')
     } finally {
       setLoading(false)
     }
   }
 
   useEffect(() => {
-    fetchOrders()
-    const interval = setInterval(fetchOrders, 5000)
+    fetchFeed()
+    const interval = setInterval(fetchFeed, 5000)
     return () => clearInterval(interval)
   }, [])
 
-  // Extract unique locations for filter
+  // Extract unique locations
   const locations = data
-    ? Array.from(new Set(data.orders.map((o) => o.location))).sort()
+    ? Array.from(new Set(data.items.map((i) => i.location))).sort()
     : []
 
   const filtered = data
     ? locationFilter === 'all'
-      ? data.orders
-      : data.orders.filter((o) => o.location === locationFilter)
+      ? data.items
+      : data.items.filter((i) => i.location === locationFilter)
     : []
+
+  // Total revenue for the filtered items
+  const totalRevenue = filtered.reduce(
+    (sum, i) => sum + i.price * i.quantity,
+    0,
+  )
+
+  // Group items by transaction for compact display
+  const grouped: Array<{
+    time: string
+    transactionId: number
+    table: number
+    location: string
+    clientName: string | null
+    items: LiveItem[]
+    isNew: boolean
+  }> = []
+
+  if (filtered.length > 0) {
+    let currentGroup: (typeof grouped)[0] | null = null
+    for (const item of filtered) {
+      if (!currentGroup || currentGroup.transactionId !== item.transactionId) {
+        if (currentGroup) grouped.push(currentGroup)
+        currentGroup = {
+          time: item.time,
+          transactionId: item.transactionId,
+          table: item.table,
+          location: item.location,
+          clientName: item.clientName,
+          items: [item],
+          isNew: newIds.has(item.id),
+        }
+      } else {
+        currentGroup.items.push(item)
+        if (newIds.has(item.id)) currentGroup.isNew = true
+      }
+    }
+    if (currentGroup) grouped.push(currentGroup)
+  }
 
   if (loading) {
     return (
-      <div className="space-y-3 animate-fade-in">
-        <h1 className="text-xl font-semibold mb-4">Live Orders</h1>
-        {Array.from({ length: 5 }).map((_, i) => (
-          <div key={i} className="bg-card border border-border rounded-xl p-4">
-            <Skeleton className="h-4 w-3/4 mb-2" />
-            <Skeleton className="h-3 w-1/2" />
+      <div className="space-y-2 animate-fade-in">
+        <h1 className="text-xl font-semibold mb-4">Live Feed</h1>
+        {Array.from({ length: 8 }).map((_, i) => (
+          <div
+            key={i}
+            className="bg-card border border-border rounded-xl p-3 flex items-center gap-3"
+          >
+            <Skeleton className="w-10 h-10 rounded-lg shrink-0" />
+            <div className="flex-1 space-y-1">
+              <Skeleton className="h-4 w-3/4" />
+              <Skeleton className="h-3 w-1/3" />
+            </div>
           </div>
         ))}
       </div>
@@ -225,27 +166,53 @@ export function OrdersPage() {
   }
 
   return (
-    <div className="space-y-3 animate-fade-in-up pb-24">
-      {/* Header with stats */}
+    <div className="space-y-2 animate-fade-in-up pb-24">
+      {/* Header */}
       <div className="flex items-center justify-between mb-1">
-        <h1 className="text-xl font-semibold">Live Orders</h1>
+        <h1 className="text-xl font-semibold">Live Feed</h1>
         {data && (
-          <div className="flex items-center gap-3 text-xs">
-            <div className="flex items-center gap-1.5">
-              <div className="w-1.5 h-1.5 rounded-full bg-status-amber animate-pulse" />
-              <span className="text-muted-foreground">
-                {data.open} open
-              </span>
-            </div>
-            <div className="flex items-center gap-1.5">
-              <div className="w-1.5 h-1.5 rounded-full bg-status-green" />
-              <span className="text-muted-foreground">
-                {data.closed} closed
-              </span>
-            </div>
+          <div className="flex items-center gap-1.5 text-xs">
+            <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+            <span className="text-muted-foreground">Live</span>
           </div>
         )}
       </div>
+
+      {/* Revenue + stats card */}
+      {data && (
+        <div className="bg-card border border-border rounded-xl p-4 mb-1">
+          <div className="flex items-end justify-between gap-4">
+            <div>
+              <div className="text-xs text-muted-foreground uppercase tracking-wide mb-1">
+                Revenue today
+              </div>
+              <div className="text-3xl font-bold text-foreground tabular-nums">
+                {formatCurrency(totalRevenue)}
+              </div>
+            </div>
+            <div className="flex items-center gap-4 text-xs shrink-0 pb-1">
+              <div className="text-right">
+                <div className="text-muted-foreground">Items</div>
+                <div className="font-semibold text-foreground tabular-nums">
+                  {filtered.length}
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-muted-foreground">Open</div>
+                <div className="font-semibold text-status-amber tabular-nums">
+                  {data.openOrders}
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-muted-foreground">Closed</div>
+                <div className="font-semibold text-status-green tabular-nums">
+                  {data.closedOrders}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Location filter */}
       {locations.length > 1 && (
@@ -259,10 +226,10 @@ export function OrdersPage() {
                 : 'bg-secondary text-secondary-foreground hover:bg-secondary/80',
             )}
           >
-            All ({data?.total || 0})
+            All ({data?.totalItems || 0})
           </button>
           {locations.map((loc) => {
-            const count = data?.orders.filter((o) => o.location === loc).length || 0
+            const count = data?.items.filter((i) => i.location === loc).length || 0
             return (
               <button
                 key={loc}
@@ -288,7 +255,7 @@ export function OrdersPage() {
           <button
             onClick={() => {
               setLoading(true)
-              fetchOrders()
+              fetchFeed()
             }}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-secondary text-secondary-foreground text-xs font-medium hover:bg-secondary/80 transition-colors"
           >
@@ -302,15 +269,94 @@ export function OrdersPage() {
       {!error && filtered.length === 0 && (
         <EmptyState
           icon={ShoppingBag}
-          title="No orders yet"
-          description="Orders will appear here as they come in from Poster"
+          title="No items yet"
+          description="Items from Poster will appear here as orders close"
         />
       )}
 
-      {/* Order rows */}
-      {filtered.map((order) => (
-        <OrderRow key={order.transactionId} order={order} />
-      ))}
+      {/* Item feed grouped by transaction */}
+      {grouped.map((group) => {
+        const groupTotal = group.items.reduce(
+          (sum, i) => sum + i.price * i.quantity,
+          0,
+        )
+        return (
+          <div
+            key={group.transactionId}
+            className={cn(
+              'bg-card border rounded-xl overflow-hidden transition-all',
+              group.isNew
+                ? 'border-primary/50 shadow-[0_0_20px_rgba(150,220,100,0.15)] animate-fade-in-up'
+                : 'border-border',
+            )}
+          >
+            {/* Transaction header */}
+            <div className="px-4 py-2 flex items-center justify-between border-b border-border/50 bg-background/30">
+              <div className="flex items-center gap-2 text-xs">
+                <span className="font-mono text-muted-foreground">
+                  {formatTime(group.time)}
+                </span>
+                <span className="text-muted-foreground">·</span>
+                <span className="font-medium text-foreground">
+                  Table {group.table}
+                </span>
+                <span className="text-muted-foreground">·</span>
+                <span className="text-muted-foreground truncate">
+                  {group.location}
+                </span>
+                {group.clientName && (
+                  <>
+                    <span className="text-muted-foreground">·</span>
+                    <span className="text-muted-foreground truncate">
+                      {group.clientName}
+                    </span>
+                  </>
+                )}
+              </div>
+              <span className="text-xs text-muted-foreground tabular-nums shrink-0 ml-2">
+                {formatRelative(group.time)}
+              </span>
+            </div>
+
+            {/* Items */}
+            <div className="divide-y divide-border/30">
+              {group.items.map((item) => (
+                <div
+                  key={item.id}
+                  className={cn(
+                    'px-4 py-2.5 flex items-center justify-between gap-3',
+                    newIds.has(item.id) && 'bg-primary/5',
+                  )}
+                >
+                  <div className="flex-1 min-w-0">
+                    <span className="text-sm font-medium text-foreground">
+                      {item.quantity > 1 && (
+                        <span className="text-muted-foreground mr-1">
+                          {item.quantity}×
+                        </span>
+                      )}
+                      {item.productName}
+                    </span>
+                  </div>
+                  <span className="text-sm font-semibold text-foreground tabular-nums shrink-0">
+                    {formatCurrency(item.price)}
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            {/* Transaction total */}
+            <div className="px-4 py-2 flex items-center justify-between bg-background/20 border-t border-border/30">
+              <span className="text-xs text-muted-foreground">
+                {group.items.length} {group.items.length === 1 ? 'item' : 'items'}
+              </span>
+              <span className="text-xs font-semibold text-foreground tabular-nums">
+                {formatCurrency(groupTotal)}
+              </span>
+            </div>
+          </div>
+        )
+      })}
     </div>
   )
 }

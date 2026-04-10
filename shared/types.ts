@@ -88,6 +88,7 @@ export interface PosterTransaction {
   client_lastname: string | null
   table_name: string
   name: string // waiter/location
+  spot_id?: string
   products?: PosterTransactionProduct[]
 }
 

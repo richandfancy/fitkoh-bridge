@@ -108,6 +108,46 @@ export class PosterClient {
     return this.request('menu.getProducts')
   }
 
+  // Detailed transactions with inline products — used for live item feed
+  async getDetailedTransactions(
+    dateFrom: string,
+    dateTo: string,
+    perPage = 500,
+  ): Promise<
+    Array<{
+      transaction_id: number
+      date_close: string
+      client_id: number
+      table_id: number
+      spot_id: number
+      products: Array<{
+        product_id: number
+        num: number
+        product_sum: string
+      }>
+    }>
+  > {
+    const raw = await this.request<{
+      data: Array<{
+        transaction_id: number
+        date_close: string
+        client_id: number
+        table_id: number
+        spot_id: number
+        products: Array<{
+          product_id: number
+          num: number
+          product_sum: string
+        }>
+      }>
+    }>('transactions.getTransactions', {
+      date_from: dateFrom,
+      date_to: dateTo,
+      per_page: String(perPage),
+    })
+    return raw?.data || []
+  }
+
   // For pre-invoice: get all transactions for a specific client in a date range
   async getClientTransactions(
     clientId: number,

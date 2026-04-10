@@ -26,109 +26,110 @@ app.get('/stats', async (c) => {
   return c.json(stats)
 })
 
-// Live orders from Poster (today, or custom date range)
+// Live item feed from Poster — individual menu items as they're sold
 app.get('/orders', async (c) => {
   const date = c.req.query('date') // YYYY-MM-DD optional, defaults to today
   const poster = new PosterClient(c.env.POSTER_ACCESS_TOKEN)
 
-  // Format for Poster: YYYYMMDD
-  const target = date
-    ? date.replace(/-/g, '')
-    : new Date().toISOString().split('T')[0].replace(/-/g, '')
+  const target = date || new Date().toISOString().split('T')[0]
 
-  let txns = []
+  let transactions: Awaited<ReturnType<typeof poster.getDetailedTransactions>> = []
+  let products: Awaited<ReturnType<typeof poster.getProducts>> = []
+  let dashTxns: Awaited<ReturnType<typeof poster.getTransactions>> = []
+
   try {
-    const raw = await poster.getTransactions(target, target)
-    txns = Array.isArray(raw) ? raw : []
+    // Fetch in parallel
+    const [txnsResult, productsResult, dashResult] = await Promise.all([
+      poster.getDetailedTransactions(target, target),
+      poster.getProducts(),
+      poster.getTransactions(target.replace(/-/g, ''), target.replace(/-/g, '')),
+    ])
+    transactions = txnsResult
+    products = productsResult
+    dashTxns = Array.isArray(dashResult) ? dashResult : []
   } catch (err) {
     return c.json(
       {
-        error: err instanceof Error ? err.message : 'Failed to fetch orders',
+        error: err instanceof Error ? err.message : 'Failed to fetch items',
       },
       500,
     )
   }
 
-  // Normalize into a friendly shape for the dashboard
-  const orders = txns.map((t) => {
-    const clientName =
-      t.client_firstname || t.client_lastname
-        ? `${t.client_lastname || ''} ${t.client_firstname || ''}`.trim()
-        : null
-    const location = (t.name || '').trim() || 'Unknown'
-    return {
-      transactionId: t.transaction_id,
-      status: t.status === '2' ? 'closed' : 'open',
-      table: t.table_name || '—',
-      location,
-      clientId: t.client_id && t.client_id !== '0' ? Number(t.client_id) : null,
-      clientName,
-      total: Number(t.sum || 0) / 100,
-      openedAt: t.date_start
-        ? new Date(Number(t.date_start)).toISOString()
-        : null,
-      closedAt:
-        t.date_close && t.date_close !== '0'
-          ? new Date(Number(t.date_close)).toISOString()
-          : null,
-    }
-  })
+  // Build product ID -> name map
+  const productMap = new Map(
+    products.map((p) => [
+      String(p.product_id),
+      (p.product_name || '').replace(/^food_/, ''),
+    ]),
+  )
 
-  // Sort: open first, then by opened timestamp descending
-  orders.sort((a, b) => {
-    if (a.status !== b.status) return a.status === 'open' ? -1 : 1
-    return (b.openedAt || '').localeCompare(a.openedAt || '')
-  })
+  // Build client ID -> name + spot ID -> location maps from dash transactions
+  const clientNames = new Map<string, string>()
+  const spotNames = new Map<string, string>()
+  for (const t of dashTxns) {
+    if (t.client_id && t.client_id !== '0' && (t.client_firstname || t.client_lastname)) {
+      clientNames.set(
+        t.client_id,
+        `${t.client_lastname || ''} ${t.client_firstname || ''}`.trim(),
+      )
+    }
+    if (t.spot_id && t.name) {
+      spotNames.set(String(t.spot_id), t.name.trim())
+    }
+  }
+
+  // Flatten transactions into individual items
+  type LiveItem = {
+    id: string
+    time: string
+    productId: number
+    productName: string
+    quantity: number
+    price: number
+    table: number
+    location: string
+    clientName: string | null
+    transactionId: number
+  }
+
+  const items: LiveItem[] = []
+  for (const t of transactions) {
+    const location = spotNames.get(String(t.spot_id)) || 'Unknown'
+    const clientName = clientNames.get(String(t.client_id)) || null
+
+    for (let i = 0; i < (t.products || []).length; i++) {
+      const p = t.products[i]
+      const productIdStr = String(p.product_id)
+      const name = productMap.get(productIdStr) || `Product #${productIdStr}`
+      items.push({
+        id: `${t.transaction_id}-${i}`,
+        time: t.date_close,
+        productId: p.product_id,
+        productName: name,
+        quantity: Number(p.num || 1),
+        price: Number(p.product_sum || 0),
+        table: t.table_id,
+        location,
+        clientName,
+        transactionId: t.transaction_id,
+      })
+    }
+  }
+
+  // Sort by time descending (newest first)
+  items.sort((a, b) => b.time.localeCompare(a.time))
+
+  // Count open orders (from dash.getTransactions)
+  const openOrders = dashTxns.filter((t) => t.status === '1').length
 
   return c.json({
-    date: date || new Date().toISOString().split('T')[0],
-    total: orders.length,
-    open: orders.filter((o) => o.status === 'open').length,
-    closed: orders.filter((o) => o.status === 'closed').length,
-    orders,
+    date: target,
+    totalItems: items.length,
+    openOrders,
+    closedOrders: dashTxns.filter((t) => t.status === '2').length,
+    items,
   })
-})
-
-// Single order detail with products
-app.get('/orders/:transactionId', async (c) => {
-  const transactionId = c.req.param('transactionId')
-  const poster = new PosterClient(c.env.POSTER_ACCESS_TOKEN)
-
-  try {
-    const [detail] = await poster.getTransaction(transactionId, true)
-    if (!detail) return c.json({ error: 'Order not found' }, 404)
-
-    // Get product names
-    const products = await poster.getProducts()
-    const productMap = new Map(products.map((p) => [p.product_id, p.product_name]))
-
-    const items = (detail.products || []).map((p) => ({
-      productId: p.product_id,
-      name: (productMap.get(p.product_id) || `Product #${p.product_id}`).replace(/^food_/, ''),
-      quantity: Number(p.num || 1),
-      unitPrice: Number(p.product_price || 0) / 100,
-    }))
-
-    return c.json({
-      transactionId: detail.transaction_id,
-      status: detail.status === '2' ? 'closed' : 'open',
-      table: detail.table_name || '—',
-      location: (detail.name || '').trim(),
-      clientName:
-        detail.client_firstname || detail.client_lastname
-          ? `${detail.client_lastname || ''} ${detail.client_firstname || ''}`.trim()
-          : null,
-      total: Number(detail.sum || 0) / 100,
-      items,
-    })
-  } catch (err) {
-    return c.json(
-      {
-        error: err instanceof Error ? err.message : 'Failed to fetch order',
-      },
-      500,
-    )
-  }
 })
 
 // Activity log (paginated, filterable)
