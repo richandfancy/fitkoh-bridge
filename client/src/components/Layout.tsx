@@ -1,5 +1,5 @@
 import { useLocation } from 'wouter'
-import { Activity, Users, AlertTriangle, Settings } from 'lucide-react'
+import { Activity, ShoppingBag, Users, AlertTriangle, Settings } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/contexts/auth-context'
 import { api } from '@/lib/api'
@@ -8,6 +8,7 @@ import type { DashboardStats } from '@shared/types'
 
 const NAV_ITEMS = [
   { path: '/', icon: Activity, label: 'Activity' },
+  { path: '/orders', icon: ShoppingBag, label: 'Orders' },
   { path: '/guests', icon: Users, label: 'Guests' },
   { path: '/dead-letters', icon: AlertTriangle, label: 'Errors' },
   { path: '/settings', icon: Settings, label: 'Settings' },

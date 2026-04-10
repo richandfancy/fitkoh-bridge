@@ -7,6 +7,7 @@ import { Loader2 } from 'lucide-react'
 
 // Lazy-loaded pages (create stubs for now)
 import { ActivityPage } from '@/pages/Activity'
+import { OrdersPage } from '@/pages/Orders'
 import { GuestsPage } from '@/pages/Guests'
 import { GuestDetailPage } from '@/pages/GuestDetail'
 import { DeadLettersPage } from '@/pages/DeadLetters'
@@ -32,6 +33,7 @@ function AppContent() {
     <Layout>
       <Switch>
         <Route path="/" component={ActivityPage} />
+        <Route path="/orders" component={OrdersPage} />
         <Route path="/guests" component={GuestsPage} />
         <Route path="/guests/:id" component={GuestDetailPage} />
         <Route path="/pre-invoice/:posterClientId?" component={PreInvoicePage} />

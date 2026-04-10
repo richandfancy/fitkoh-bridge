@@ -26,6 +26,111 @@ app.get('/stats', async (c) => {
   return c.json(stats)
 })
 
+// Live orders from Poster (today, or custom date range)
+app.get('/orders', async (c) => {
+  const date = c.req.query('date') // YYYY-MM-DD optional, defaults to today
+  const poster = new PosterClient(c.env.POSTER_ACCESS_TOKEN)
+
+  // Format for Poster: YYYYMMDD
+  const target = date
+    ? date.replace(/-/g, '')
+    : new Date().toISOString().split('T')[0].replace(/-/g, '')
+
+  let txns = []
+  try {
+    const raw = await poster.getTransactions(target, target)
+    txns = Array.isArray(raw) ? raw : []
+  } catch (err) {
+    return c.json(
+      {
+        error: err instanceof Error ? err.message : 'Failed to fetch orders',
+      },
+      500,
+    )
+  }
+
+  // Normalize into a friendly shape for the dashboard
+  const orders = txns.map((t) => {
+    const clientName =
+      t.client_firstname || t.client_lastname
+        ? `${t.client_lastname || ''} ${t.client_firstname || ''}`.trim()
+        : null
+    const location = (t.name || '').trim() || 'Unknown'
+    return {
+      transactionId: t.transaction_id,
+      status: t.status === '2' ? 'closed' : 'open',
+      table: t.table_name || '—',
+      location,
+      clientId: t.client_id && t.client_id !== '0' ? Number(t.client_id) : null,
+      clientName,
+      total: Number(t.sum || 0) / 100,
+      openedAt: t.date_start
+        ? new Date(Number(t.date_start)).toISOString()
+        : null,
+      closedAt:
+        t.date_close && t.date_close !== '0'
+          ? new Date(Number(t.date_close)).toISOString()
+          : null,
+    }
+  })
+
+  // Sort: open first, then by opened timestamp descending
+  orders.sort((a, b) => {
+    if (a.status !== b.status) return a.status === 'open' ? -1 : 1
+    return (b.openedAt || '').localeCompare(a.openedAt || '')
+  })
+
+  return c.json({
+    date: date || new Date().toISOString().split('T')[0],
+    total: orders.length,
+    open: orders.filter((o) => o.status === 'open').length,
+    closed: orders.filter((o) => o.status === 'closed').length,
+    orders,
+  })
+})
+
+// Single order detail with products
+app.get('/orders/:transactionId', async (c) => {
+  const transactionId = c.req.param('transactionId')
+  const poster = new PosterClient(c.env.POSTER_ACCESS_TOKEN)
+
+  try {
+    const [detail] = await poster.getTransaction(transactionId, true)
+    if (!detail) return c.json({ error: 'Order not found' }, 404)
+
+    // Get product names
+    const products = await poster.getProducts()
+    const productMap = new Map(products.map((p) => [p.product_id, p.product_name]))
+
+    const items = (detail.products || []).map((p) => ({
+      productId: p.product_id,
+      name: (productMap.get(p.product_id) || `Product #${p.product_id}`).replace(/^food_/, ''),
+      quantity: Number(p.num || 1),
+      unitPrice: Number(p.product_price || 0) / 100,
+    }))
+
+    return c.json({
+      transactionId: detail.transaction_id,
+      status: detail.status === '2' ? 'closed' : 'open',
+      table: detail.table_name || '—',
+      location: (detail.name || '').trim(),
+      clientName:
+        detail.client_firstname || detail.client_lastname
+          ? `${detail.client_lastname || ''} ${detail.client_firstname || ''}`.trim()
+          : null,
+      total: Number(detail.sum || 0) / 100,
+      items,
+    })
+  } catch (err) {
+    return c.json(
+      {
+        error: err instanceof Error ? err.message : 'Failed to fetch order',
+      },
+      500,
+    )
+  }
+})
+
 // Activity log (paginated, filterable)
 app.get('/activity', async (c) => {
   const limit = Number(c.req.query('limit') || 50)
