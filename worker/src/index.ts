@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { cors } from 'hono/cors'
 import { Scalar } from '@scalar/hono-api-reference'
 import type { Env } from './env'
 import { dashboardAuth } from './middleware/auth'
@@ -12,6 +13,31 @@ import mcp from './routes/mcp'
 import { warmMealsCache } from './services/cache-warmer'
 
 const app = new Hono<{ Bindings: Env }>()
+
+// ---------------------------------------------------------------------------
+// CORS — only /api/v1/* and /mcp/* are browser-callable. Dashboard routes
+// stay same-origin only (no CORS), since they use cookie auth and are only
+// served from the bridge's own domain.
+// ---------------------------------------------------------------------------
+const CORS_ALLOWED_ORIGINS = [
+  'https://fitkoh.app',
+  'https://s.fitkoh.app',
+  'http://localhost:5173',
+  'http://localhost:3000',
+]
+
+const corsOptions = {
+  origin: (origin: string) =>
+    CORS_ALLOWED_ORIGINS.includes(origin) ? origin : null,
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
+  maxAge: 3600,
+  credentials: false,
+}
+
+app.use('/api/v1/*', cors(corsOptions))
+app.use('/mcp', cors(corsOptions))
+app.use('/mcp/*', cors(corsOptions))
 
 // Health check
 app.get('/api/health', (c) => {

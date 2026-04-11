@@ -6,6 +6,7 @@ import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Env } from '../env'
 import { apiKeyAuth, type V1Variables } from '../middleware/api-key'
 import { getCachedOrFetchMeals } from '../services/meals-cache'
+import { signJwt } from '../services/jwt'
 import { streamOrdersRoute } from './stream'
 
 const app = new OpenAPIHono<{ Bindings: Env; Variables: V1Variables }>()
@@ -135,10 +136,21 @@ const MealsResponseSchema = z
 const HealthResponseSchema = z
   .object({
     ok: z.literal(true),
-    apiKey: z.object({
-      id: z.number().openapi({ example: 1 }),
-      name: z.string().openapi({ example: 'FitKoh production' }),
-    }),
+    apiKey: z
+      .object({
+        id: z.number().openapi({ example: 1 }),
+        name: z.string().openapi({ example: 'FitKoh production' }),
+      })
+      .optional()
+      .openapi({ description: 'Present when authenticated via an API key' }),
+    jwt: z
+      .object({
+        sub: z.number().openapi({ example: 2512, description: 'posterClientId' }),
+        scope: z.string().openapi({ example: 'meals:read' }),
+        exp: z.number().openapi({ example: 1712500000 }),
+      })
+      .optional()
+      .openapi({ description: 'Present when authenticated via a bridge JWT' }),
     version: z.literal('v1'),
   })
   .openapi('HealthResponse')
@@ -202,6 +214,10 @@ const mealsRoute = createRoute({
       content: { 'application/json': { schema: ErrorResponseSchema } },
       description: 'Missing or invalid API key',
     },
+    403: {
+      content: { 'application/json': { schema: ErrorResponseSchema } },
+      description: 'JWT scoped to a different guest',
+    },
     500: {
       content: { 'application/json': { schema: ErrorResponseSchema } },
       description: 'Upstream (Poster) or bridge error',
@@ -213,6 +229,13 @@ app.openapi(mealsRoute, async (c) => {
   const { posterClientId } = c.req.valid('param')
   const { date: queryDate } = c.req.valid('query')
   const date = queryDate || new Date().toISOString().split('T')[0]
+
+  // JWT scope enforcement: a bridge JWT is locked to a single posterClientId
+  // (the `sub` claim). API keys have full access and skip this check.
+  const jwt = c.get('jwt')
+  if (jwt && jwt.sub !== posterClientId) {
+    return c.json({ error: 'JWT is scoped to a different posterClientId' }, 403)
+  }
 
   try {
     const { data, fromCache } = await getCachedOrFetchMeals(c.env, posterClientId, date)
@@ -255,11 +278,124 @@ const healthRoute = createRoute({
 
 app.openapi(healthRoute, async (c) => {
   const apiKey = c.get('apiKey')
+  const jwt = c.get('jwt')
   return c.json(
     {
       ok: true as const,
-      apiKey: { id: apiKey.id, name: apiKey.name },
+      ...(apiKey ? { apiKey: { id: apiKey.id, name: apiKey.name } } : {}),
+      ...(jwt ? { jwt: { sub: jwt.sub, scope: jwt.scope, exp: jwt.exp } } : {}),
       version: 'v1' as const,
+    },
+    200,
+  )
+})
+
+// ---------------------------------------------------------------------------
+// POST /auth/token — issue a short-lived JWT scoped to one guest.
+//
+// Called by the FitKoh backend with its service API key. The returned JWT is
+// sent to the browser and used for direct /meals/:posterClientId calls — so
+// the master API key never leaves the server.
+//
+// Only API keys can issue tokens. JWT holders get 403 to prevent infinite
+// self-renewal chains.
+// ---------------------------------------------------------------------------
+
+const TokenRequestSchema = z
+  .object({
+    posterClientId: z
+      .number()
+      .int()
+      .positive()
+      .openapi({ example: 2512, description: 'Poster POS client id for the guest' }),
+    expiresIn: z
+      .number()
+      .int()
+      .min(60)
+      .max(86400)
+      .default(3600)
+      .openapi({
+        example: 3600,
+        description: 'Token lifetime in seconds (60 min … 24 h).',
+      }),
+  })
+  .openapi('TokenRequest')
+
+const TokenResponseSchema = z
+  .object({
+    token: z
+      .string()
+      .openapi({
+        example: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
+        description: 'Signed bridge JWT. Send as `Authorization: Bearer <token>`.',
+      }),
+    expiresAt: z
+      .number()
+      .openapi({
+        example: 1712500000,
+        description: 'Unix timestamp (seconds) when the token expires.',
+      }),
+    posterClientId: z.number().openapi({ example: 2512 }),
+  })
+  .openapi('TokenResponse')
+
+const tokenRoute = createRoute({
+  method: 'post',
+  path: '/auth/token',
+  tags: ['Auth'],
+  summary: 'Issue a short-lived JWT scoped to a specific guest',
+  description: [
+    'Exchange a service API key for a short-lived JWT that can be used from',
+    'the browser. The JWT is locked to the supplied `posterClientId` and can',
+    'only fetch meals for that one guest.',
+    '',
+    'Only API keys can issue tokens — JWTs cannot self-renew.',
+  ].join('\n'),
+  security: [{ ApiKeyAuth: [] }],
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: TokenRequestSchema,
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: TokenResponseSchema } },
+      description: 'Token issued',
+    },
+    401: {
+      content: { 'application/json': { schema: ErrorResponseSchema } },
+      description: 'Missing or invalid API key',
+    },
+    403: {
+      content: { 'application/json': { schema: ErrorResponseSchema } },
+      description: 'JWTs cannot issue tokens',
+    },
+  },
+})
+
+app.openapi(tokenRoute, async (c) => {
+  // Block JWT-authenticated callers from minting new tokens. Only master
+  // API keys held server-side may issue tokens.
+  if (c.get('jwt') && !c.get('apiKey')) {
+    return c.json({ error: 'JWTs cannot issue tokens. Use an API key.' }, 403)
+  }
+
+  const { posterClientId, expiresIn } = c.req.valid('json')
+  const token = await signJwt(
+    c.env,
+    { sub: posterClientId, scope: 'meals:read' },
+    expiresIn,
+  )
+
+  return c.json(
+    {
+      token,
+      expiresAt: Math.floor(Date.now() / 1000) + expiresIn,
+      posterClientId,
     },
     200,
   )

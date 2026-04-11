@@ -7,4 +7,7 @@ export interface Env {
   RESEND_API_KEY: string
   APP_NAME: string
   ENVIRONMENT: string
+  // Optional — HS256 secret for bridge JWTs issued to FitKoh app users.
+  // Falls back to a hard-coded dev value in services/jwt.ts if unset.
+  JWT_SECRET?: string
 }
