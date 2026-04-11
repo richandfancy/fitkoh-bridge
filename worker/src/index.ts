@@ -9,6 +9,7 @@ import admin from './routes/admin'
 import v1 from './routes/v1'
 import stream from './routes/stream'
 import mcp from './routes/mcp'
+import { warmMealsCache } from './services/cache-warmer'
 
 const app = new Hono<{ Bindings: Env }>()
 
@@ -57,4 +58,20 @@ app.route('/api/dashboard', api)
 app.use('/api/admin/*', dashboardAuth)
 app.route('/api/admin', admin)
 
-export default app
+// Export as a handler object so Cloudflare invokes the `scheduled` function
+// on every Cron Trigger tick. The `fetch` handler keeps the Hono app routing
+// exactly as before — any issue in the cron path must not break HTTP traffic.
+export default {
+  fetch: app.fetch,
+  async scheduled(
+    _event: ScheduledEvent,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<void> {
+    ctx.waitUntil(
+      warmMealsCache(env).catch((err) => {
+        console.error('Cache warm failed:', err)
+      }),
+    )
+  },
+}

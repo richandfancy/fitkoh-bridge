@@ -8,6 +8,7 @@ import {
   listApiKeys,
   revokeApiKey,
 } from '../services/api-keys'
+import { warmMealsCache } from '../services/cache-warmer'
 
 const app = new Hono<{ Bindings: Env }>()
 
@@ -70,6 +71,14 @@ app.post('/api-keys/:id/revoke', async (c) => {
   if (!id || isNaN(id)) return c.json({ error: 'Invalid id' }, 400)
   await revokeApiKey(c.env.DB, id)
   return c.json({ ok: true })
+})
+
+// Manual cache warm trigger — mirrors the Cron handler. Useful for testing
+// in `wrangler dev` (which does not fire cron triggers) and for ops when we
+// need to force-refresh the cache without waiting for the next tick.
+app.post('/warm-cache', async (c) => {
+  const result = await warmMealsCache(c.env)
+  return c.json(result)
 })
 
 export default app
