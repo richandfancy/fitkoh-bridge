@@ -1,18 +1,147 @@
 // Public API v1 — for external systems (FitKoh app, Homebase, etc.)
-// Authenticated via X-API-Key header
+// Authenticated via X-API-Key header or Bearer token
+// OpenAPI spec exposed at /openapi.json (unauthenticated)
 
-import { Hono } from 'hono'
+import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Env } from '../env'
 import { apiKeyAuth, type V1Variables } from '../middleware/api-key'
 import { PosterClient } from '../services/poster'
 
-const app = new Hono<{ Bindings: Env; Variables: V1Variables }>()
+const app = new OpenAPIHono<{ Bindings: Env; Variables: V1Variables }>()
 
-// All v1 routes require API key
+// Register the API key security scheme
+app.openAPIRegistry.registerComponent('securitySchemes', 'ApiKeyAuth', {
+  type: 'apiKey',
+  name: 'X-API-Key',
+  in: 'header',
+  description: 'API key issued by the FitKoh Bridge admin. Prefix with "fbk_".',
+})
+
+// Expose OpenAPI JSON spec BEFORE auth middleware so it is publicly reachable.
+app.doc('/openapi.json', {
+  openapi: '3.1.0',
+  info: {
+    title: 'FitKoh Bridge API',
+    version: '1.0.0',
+    description:
+      'Public API for FitKoh Bridge — cross-system data hub connecting Clock PMS, Poster POS, and consumer apps (FitKoh, Homebase).',
+  },
+  servers: [
+    { url: 'https://bridge.fitkoh.app', description: 'Production' },
+    { url: 'https://s.bridge.fitkoh.app', description: 'Staging' },
+    { url: 'http://localhost:8787', description: 'Local dev' },
+  ],
+})
+
+// All other v1 routes require an API key
 app.use('*', apiKeyAuth)
 
 // Cache TTL in seconds — short enough for "real-time" feel, long enough to protect Poster API
 const CACHE_TTL_SECONDS = 30
+
+// ---------------------------------------------------------------------------
+// Zod schemas (with OpenAPI metadata)
+// ---------------------------------------------------------------------------
+
+const MealItemSchema = z
+  .object({
+    id: z
+      .string()
+      .openapi({
+        example: '157441-0',
+        description: 'Stable item id: `<posterTransactionId>-<index>`',
+      }),
+    time: z
+      .string()
+      .openapi({
+        example: '2026-04-11 08:44:03',
+        description: 'Transaction close time as reported by Poster (local time).',
+      }),
+    posterProductId: z
+      .string()
+      .openapi({ example: '314', description: 'Poster product id' }),
+    productName: z
+      .string()
+      .openapi({ example: 'Greek Yogurt Bowl', description: 'Human-readable product name' }),
+    quantity: z.number().openapi({ example: 1 }),
+    price: z.number().openapi({ example: 220, description: 'Unit price in minor currency units' }),
+    fitkohMenuItemId: z
+      .number()
+      .nullable()
+      .openapi({
+        example: 42,
+        description: 'Mapped FitKoh menu item id, or `null` if the Poster product is unmapped.',
+      }),
+  })
+  .openapi('MealItem')
+
+const MealsResponseSchema = z
+  .object({
+    posterClientId: z.number().openapi({ example: 2512 }),
+    date: z.string().openapi({ example: '2026-04-07' }),
+    items: z.array(MealItemSchema),
+    total: z
+      .number()
+      .openapi({ example: 760, description: 'Sum of price * quantity across all items' }),
+    cachedAt: z
+      .string()
+      .openapi({
+        example: '2026-04-07T09:12:33.123Z',
+        description: 'ISO 8601 timestamp at which the data was cached in D1.',
+      }),
+    fromCache: z
+      .boolean()
+      .openapi({
+        example: true,
+        description: 'True when the response was served from the D1 cache (age < 30s).',
+      }),
+  })
+  .openapi('MealsResponse')
+
+const HealthResponseSchema = z
+  .object({
+    ok: z.literal(true),
+    apiKey: z.object({
+      id: z.number().openapi({ example: 1 }),
+      name: z.string().openapi({ example: 'FitKoh production' }),
+    }),
+    version: z.literal('v1'),
+  })
+  .openapi('HealthResponse')
+
+const ErrorResponseSchema = z
+  .object({
+    error: z.string().openapi({ example: 'Invalid or revoked API key' }),
+  })
+  .openapi('ErrorResponse')
+
+const PosterClientIdParam = z.object({
+  posterClientId: z.coerce
+    .number()
+    .int()
+    .positive()
+    .openapi({
+      param: { name: 'posterClientId', in: 'path' },
+      example: 2512,
+      description: 'Poster POS client id for the guest.',
+    }),
+})
+
+const MealsQuerySchema = z.object({
+  date: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'Use YYYY-MM-DD')
+    .optional()
+    .openapi({
+      param: { name: 'date', in: 'query' },
+      example: '2026-04-07',
+      description: 'Target day in `YYYY-MM-DD`. Defaults to today (UTC).',
+    }),
+})
+
+// ---------------------------------------------------------------------------
+// Meal fetch + cache logic (unchanged)
+// ---------------------------------------------------------------------------
 
 interface CachedMeals {
   posterClientId: number
@@ -42,11 +171,7 @@ async function fetchMealsForClient(
   const mapping: Record<string, number> = mappingRaw ? JSON.parse(mappingRaw) : {}
 
   // Fetch detailed transactions with inline products
-  const detailed = await poster.getDetailedTransactions(
-    date,
-    date,
-    500,
-  )
+  const detailed = await poster.getDetailedTransactions(date, date, 500)
 
   // Fetch product names in parallel
   const products = await poster.getProducts()
@@ -112,7 +237,7 @@ async function getCachedOrFetch(
 
   // Update cache (upsert)
   await env.DB.prepare(
-    'INSERT OR REPLACE INTO poster_meals_cache (cache_key, data, cached_at) VALUES (?, ?, datetime(\'now\'))',
+    "INSERT OR REPLACE INTO poster_meals_cache (cache_key, data, cached_at) VALUES (?, ?, datetime('now'))",
   )
     .bind(cacheKey, JSON.stringify(fresh))
     .run()
@@ -120,33 +245,56 @@ async function getCachedOrFetch(
   return { data: fresh, fromCache: false }
 }
 
-/**
- * GET /api/v1/meals/:posterClientId
- * Returns meal items for a guest on a specific date.
- *
- * Query params:
- *   date  — YYYY-MM-DD, defaults to today
- *
- * Headers:
- *   X-API-Key: fbk_...
- */
-app.get('/meals/:posterClientId', async (c) => {
-  const posterClientId = Number(c.req.param('posterClientId'))
-  if (!posterClientId || isNaN(posterClientId)) {
-    return c.json({ error: 'Invalid posterClientId' }, 400)
-  }
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
 
-  const date = c.req.query('date') || new Date().toISOString().split('T')[0]
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    return c.json({ error: 'Invalid date, use YYYY-MM-DD' }, 400)
-  }
+const mealsRoute = createRoute({
+  method: 'get',
+  path: '/meals/{posterClientId}',
+  tags: ['Meals'],
+  summary: 'Get guest meals for a specific date',
+  description:
+    'Returns meal items (from Poster POS) consumed by a given guest on a specific day. Results are cached in D1 for up to 30 seconds to protect the upstream Poster API.',
+  security: [{ ApiKeyAuth: [] }],
+  request: {
+    params: PosterClientIdParam,
+    query: MealsQuerySchema,
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: MealsResponseSchema } },
+      description: 'Meals for the requested guest and day',
+    },
+    400: {
+      content: { 'application/json': { schema: ErrorResponseSchema } },
+      description: 'Invalid parameters',
+    },
+    401: {
+      content: { 'application/json': { schema: ErrorResponseSchema } },
+      description: 'Missing or invalid API key',
+    },
+    500: {
+      content: { 'application/json': { schema: ErrorResponseSchema } },
+      description: 'Upstream (Poster) or bridge error',
+    },
+  },
+})
+
+app.openapi(mealsRoute, async (c) => {
+  const { posterClientId } = c.req.valid('param')
+  const { date: queryDate } = c.req.valid('query')
+  const date = queryDate || new Date().toISOString().split('T')[0]
 
   try {
     const { data, fromCache } = await getCachedOrFetch(c.env, posterClientId, date)
-    return c.json({
-      ...data,
-      fromCache,
-    })
+    return c.json(
+      {
+        ...data,
+        fromCache,
+      },
+      200,
+    )
   } catch (err) {
     return c.json(
       {
@@ -157,17 +305,36 @@ app.get('/meals/:posterClientId', async (c) => {
   }
 })
 
-/**
- * GET /api/v1/health
- * Public health check — useful for consumers to verify API key works
- */
-app.get('/health', async (c) => {
+const healthRoute = createRoute({
+  method: 'get',
+  path: '/health',
+  tags: ['Health'],
+  summary: 'Verify that the API key is valid',
+  description:
+    "Lightweight public health check. Returns the caller's API key metadata — useful for consumers to verify their key is accepted.",
+  security: [{ ApiKeyAuth: [] }],
+  responses: {
+    200: {
+      content: { 'application/json': { schema: HealthResponseSchema } },
+      description: 'API key is valid',
+    },
+    401: {
+      content: { 'application/json': { schema: ErrorResponseSchema } },
+      description: 'Missing or invalid API key',
+    },
+  },
+})
+
+app.openapi(healthRoute, async (c) => {
   const apiKey = c.get('apiKey')
-  return c.json({
-    ok: true,
-    apiKey: { id: apiKey.id, name: apiKey.name },
-    version: 'v1',
-  })
+  return c.json(
+    {
+      ok: true as const,
+      apiKey: { id: apiKey.id, name: apiKey.name },
+      version: 'v1' as const,
+    },
+    200,
+  )
 })
 
 export default app
