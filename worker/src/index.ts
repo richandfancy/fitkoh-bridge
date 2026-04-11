@@ -7,6 +7,7 @@ import api from './routes/api'
 import webhooks from './routes/webhooks'
 import admin from './routes/admin'
 import v1 from './routes/v1'
+import mcp from './routes/mcp'
 
 const app = new Hono<{ Bindings: Env }>()
 
@@ -31,6 +32,10 @@ app.get(
 // Note: /api/v1/openapi.json is registered on the v1 sub-app BEFORE the
 // apiKeyAuth middleware, so it remains publicly reachable.
 app.route('/api/v1', v1)
+
+// MCP (Model Context Protocol) endpoint — Streamable HTTP transport.
+// GET /mcp returns a public discovery JSON; POST /mcp handles JSON-RPC.
+app.route('/mcp', mcp)
 
 // Auth routes (login/logout/check — no middleware)
 app.route('/', auth)
