@@ -56,6 +56,31 @@ export function OrdersPage() {
   const [locationFilter, setLocationFilter] = useState<string>('all')
   const seenIds = useRef<Set<string>>(new Set())
   const [newIds, setNewIds] = useState<Set<string>>(new Set())
+  const dataRef = useRef<FeedResponse | null>(null)
+  const highlightTimers = useRef<Set<number>>(new Set())
+
+  // Keep a ref in sync with the latest data so SSE handlers (which close over
+  // the first render) can always read the current feed.
+  useEffect(() => {
+    dataRef.current = data
+  }, [data])
+
+  const highlightNewId = (id: string) => {
+    setNewIds((prev) => {
+      const next = new Set(prev)
+      next.add(id)
+      return next
+    })
+    const timer = window.setTimeout(() => {
+      setNewIds((prev) => {
+        const next = new Set(prev)
+        next.delete(id)
+        return next
+      })
+      highlightTimers.current.delete(timer)
+    }, 3000)
+    highlightTimers.current.add(timer)
+  }
 
   const fetchFeed = async () => {
     try {
@@ -90,9 +115,102 @@ export function OrdersPage() {
   }
 
   useEffect(() => {
-    fetchFeed()
-    const interval = setInterval(fetchFeed, 5000)
-    return () => clearInterval(interval)
+    let cancelled = false
+    let eventSource: EventSource | null = null
+    let fallbackInterval: number | null = null
+
+    const openStream = () => {
+      if (cancelled) return
+      // Same-origin EventSource automatically sends the bridge_session cookie.
+      eventSource = new EventSource('/api/v1/stream/orders')
+
+      eventSource.addEventListener('snapshot', (ev: MessageEvent) => {
+        try {
+          const payload = JSON.parse(ev.data) as { items: LiveItem[] }
+          // Stream sorts oldest → newest; the dashboard renders newest first.
+          const itemsDesc = [...payload.items].sort((a, b) =>
+            b.time.localeCompare(a.time),
+          )
+          seenIds.current = new Set(itemsDesc.map((i) => i.id))
+          const prev = dataRef.current
+          setData({
+            date: prev?.date || new Date().toISOString().split('T')[0],
+            totalItems: itemsDesc.length,
+            openOrders: prev?.openOrders ?? 0,
+            closedOrders: prev?.closedOrders ?? 0,
+            items: itemsDesc,
+          })
+        } catch {
+          /* malformed snapshot — ignore */
+        }
+      })
+
+      eventSource.addEventListener('order_item', (ev: MessageEvent) => {
+        try {
+          const item = JSON.parse(ev.data) as LiveItem
+          if (seenIds.current.has(item.id)) return
+          seenIds.current.add(item.id)
+
+          setData((prev) => {
+            if (!prev) {
+              return {
+                date: new Date().toISOString().split('T')[0],
+                totalItems: 1,
+                openOrders: 0,
+                closedOrders: 0,
+                items: [item],
+              }
+            }
+            return {
+              ...prev,
+              items: [item, ...prev.items],
+              totalItems: prev.totalItems + 1,
+            }
+          })
+          highlightNewId(item.id)
+        } catch {
+          /* malformed delta — ignore */
+        }
+      })
+
+      eventSource.onerror = () => {
+        // Close and fall back to polling. EventSource auto-reconnects on
+        // transient network errors, but after 5 min the worker closes the
+        // stream cleanly and we want to reopen rather than spin.
+        if (eventSource) {
+          eventSource.close()
+          eventSource = null
+        }
+        if (cancelled) return
+        // Start fallback polling if not already running
+        if (fallbackInterval === null) {
+          fallbackInterval = window.setInterval(fetchFeed, 5000)
+        }
+        // Try to reopen the stream after 5s
+        window.setTimeout(() => {
+          if (!cancelled) {
+            if (fallbackInterval !== null) {
+              window.clearInterval(fallbackInterval)
+              fallbackInterval = null
+            }
+            openStream()
+          }
+        }, 5000)
+      }
+    }
+
+    // Initial HTTP load, then open the SSE stream
+    fetchFeed().then(() => {
+      if (!cancelled) openStream()
+    })
+
+    return () => {
+      cancelled = true
+      if (eventSource) eventSource.close()
+      if (fallbackInterval !== null) window.clearInterval(fallbackInterval)
+      for (const timer of highlightTimers.current) window.clearTimeout(timer)
+      highlightTimers.current.clear()
+    }
   }, [])
 
   // Extract unique locations

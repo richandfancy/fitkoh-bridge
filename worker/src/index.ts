@@ -7,6 +7,7 @@ import api from './routes/api'
 import webhooks from './routes/webhooks'
 import admin from './routes/admin'
 import v1 from './routes/v1'
+import stream from './routes/stream'
 import mcp from './routes/mcp'
 
 const app = new Hono<{ Bindings: Env }>()
@@ -26,6 +27,11 @@ app.get(
     pageTitle: 'FitKoh Bridge API',
   }),
 )
+
+// SSE streaming endpoints — mounted BEFORE /api/v1 so requests to
+// /api/v1/stream/* are handled here (cookie OR ?api_key= auth) instead of
+// being caught by the v1 sub-app's X-API-Key-only middleware.
+app.route('/api/v1/stream', stream)
 
 // Public API v1 (authenticated via X-API-Key header)
 // For external systems: FitKoh app, Homebase, etc.

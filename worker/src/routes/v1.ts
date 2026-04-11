@@ -6,6 +6,7 @@ import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Env } from '../env'
 import { apiKeyAuth, type V1Variables } from '../middleware/api-key'
 import { getCachedOrFetchMeals } from '../services/meals-cache'
+import { streamOrdersRoute } from './stream'
 
 const app = new OpenAPIHono<{ Bindings: Env; Variables: V1Variables }>()
 
@@ -15,6 +16,15 @@ app.openAPIRegistry.registerComponent('securitySchemes', 'ApiKeyAuth', {
   name: 'X-API-Key',
   in: 'header',
   description: 'API key issued by the FitKoh Bridge admin. Prefix with "fbk_".',
+})
+
+// Register the SSE streaming route in the main /api/v1/openapi.json spec.
+// The actual handler lives in routes/stream.ts and is mounted at /api/v1/stream
+// BEFORE v1 in index.ts, so it intercepts the request before apiKeyAuth runs.
+// Here we only register the path for docs visibility — no handler attached.
+app.openAPIRegistry.registerPath({
+  ...streamOrdersRoute,
+  path: '/stream/orders',
 })
 
 // Expose OpenAPI JSON spec BEFORE auth middleware so it is publicly reachable.
