@@ -27,18 +27,18 @@ crons = ["* * * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "fitkoh-bridge-db"
-database_id = "placeholder-will-be-set-after-creation"
+database_id = "896d6a5c-df01-48b7-8a0f-9e25a7d4ae9e"
 migrations_dir = "../migrations"
 
 [[kv_namespaces]]
 binding = "CONFIG"
-id = "placeholder-will-be-set-after-creation"
+id = "96cbde7122194eb185551a8bb2a81640"
 
 # Staging environment
 [env.staging]
 name = "fitkoh-bridge-staging"
 routes = [
-  { pattern = "s.bridge.fitkoh.app/*", zone_name = "fitkoh.app" },
+  { pattern = "bridge-staging.fitkoh.app/*", zone_name = "fitkoh.app" },
 ]
 vars = { APP_NAME = "FitKoh Bridge (Staging)", ENVIRONMENT = "staging" }
 
@@ -51,12 +51,12 @@ run_worker_first = ["/api/*", "/docs", "/docs/*", "/mcp", "/mcp/*"]
 [[env.staging.d1_databases]]
 binding = "DB"
 database_name = "fitkoh-bridge-db-staging"
-database_id = "placeholder-will-be-set-after-creation"
+database_id = "523a0a4e-8eb1-41bf-ad42-466953304f6a"
 migrations_dir = "../migrations"
 
 [[env.staging.kv_namespaces]]
 binding = "CONFIG"
-id = "placeholder-will-be-set-after-creation"
+id = "4bb9ed8ac873450cb281b5961841c579"
 
 [env.staging.triggers]
 crons = ["* * * * *"]
