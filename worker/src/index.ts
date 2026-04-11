@@ -3,6 +3,7 @@ import { cors } from 'hono/cors'
 import { Scalar } from '@scalar/hono-api-reference'
 import type { Env } from './env'
 import { dashboardAuth } from './middleware/auth'
+import { docsAuth } from './middleware/docs-auth'
 import auth from './routes/auth'
 import api from './routes/api'
 import webhooks from './routes/webhooks'
@@ -44,7 +45,12 @@ app.get('/api/health', (c) => {
   return c.json({ ok: true, environment: c.env.ENVIRONMENT })
 })
 
-// Scalar API reference UI (public, reads /api/v1/openapi.json)
+// Docs and schema are gated behind HTTP Basic auth so the API surface
+// isn't discoverable to anyone who stumbles on the domain.
+app.use('/docs', docsAuth)
+app.use('/api/v1/openapi.json', docsAuth)
+
+// Scalar API reference UI (behind docs auth)
 app.get(
   '/docs',
   Scalar({
