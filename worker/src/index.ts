@@ -5,6 +5,7 @@ import auth from './routes/auth'
 import api from './routes/api'
 import webhooks from './routes/webhooks'
 import admin from './routes/admin'
+import v1 from './routes/v1'
 
 const app = new Hono<{ Bindings: Env }>()
 
@@ -12,6 +13,10 @@ const app = new Hono<{ Bindings: Env }>()
 app.get('/api/health', (c) => {
   return c.json({ ok: true, environment: c.env.ENVIRONMENT })
 })
+
+// Public API v1 (authenticated via X-API-Key header)
+// For external systems: FitKoh app, Homebase, etc.
+app.route('/api/v1', v1)
 
 // Auth routes (login/logout/check — no middleware)
 app.route('/', auth)

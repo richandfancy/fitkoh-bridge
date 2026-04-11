@@ -3,6 +3,11 @@ import type { Env } from '../env'
 import { MockClockClient, seedDatabase } from '../services/clock-mock'
 import { transferInvoice } from '../services/invoice-transfer'
 import { getBookingDetail } from '../db/queries'
+import {
+  createApiKey,
+  listApiKeys,
+  revokeApiKey,
+} from '../services/api-keys'
 
 const app = new Hono<{ Bindings: Env }>()
 
@@ -42,6 +47,29 @@ app.post('/sync/:clockBookingId/reset', async (c) => {
 app.post('/seed', async (c) => {
   await seedDatabase(c.env.DB)
   return c.json({ ok: true, message: 'Database seeded with mock data' })
+})
+
+// API key management
+app.get('/api-keys', async (c) => {
+  const keys = await listApiKeys(c.env.DB)
+  return c.json(keys)
+})
+
+app.post('/api-keys', async (c) => {
+  const body = await c.req.json<{ name?: string }>()
+  if (!body.name || body.name.trim().length === 0) {
+    return c.json({ error: 'Name is required' }, 400)
+  }
+  const result = await createApiKey(c.env.DB, body.name.trim())
+  // The raw key is ONLY returned here on creation — client must save it
+  return c.json(result)
+})
+
+app.post('/api-keys/:id/revoke', async (c) => {
+  const id = Number(c.req.param('id'))
+  if (!id || isNaN(id)) return c.json({ error: 'Invalid id' }, 400)
+  await revokeApiKey(c.env.DB, id)
+  return c.json({ ok: true })
 })
 
 export default app
