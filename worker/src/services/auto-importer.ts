@@ -220,23 +220,28 @@ async function deduplicateAndDispatch(
   env: Env,
   items: DispatchableItem[],
 ): Promise<{ dispatched: number; errors: number }> {
-  // Check which items are already dispatched (batch check)
-  const placeholders = items.map(() => '?').join(',')
-  const existing = await env.DB.prepare(
-    `SELECT id FROM auto_imported_items WHERE id IN (${placeholders})`,
-  )
-    .bind(...items.map((i) => i.id))
-    .all<{ id: string }>()
-  const existingIds = new Set(existing.results.map((r) => r.id))
-
-  const newItems = items.filter((i) => !existingIds.has(i.id))
-  if (newItems.length === 0) return { dispatched: 0, errors: 0 }
-
+  // R1 fix: Use atomic INSERT OR IGNORE to prevent race conditions where
+  // cron + SSE paths could both SELECT "not exists" and double-dispatch.
+  // INSERT first, then dispatch only if the insert actually wrote a new row.
   let dispatched = 0
   let errors = 0
 
-  for (const item of newItems) {
+  for (const item of items) {
     try {
+      // Attempt to claim this item atomically
+      const result = await env.DB.prepare(
+        `INSERT OR IGNORE INTO auto_imported_items (id, poster_client_id, fitkoh_user_id, fitkoh_menu_item_id, poster_product_name) VALUES (?, ?, ?, ?, ?)`,
+      ).bind(
+        item.id,
+        item.posterClientId,
+        0, // no longer FitKoh-specific, keep column for compat
+        item.fitkohMenuItemId ?? 0,
+        item.productName,
+      ).run()
+
+      if (result.meta.changes === 0) continue // Already dispatched by another path
+
+      // This is genuinely new -- dispatch webhook
       const eventData: MealOrderedData = {
         posterClientId: item.posterClientId,
         posterProductId: item.posterProductId,
@@ -254,17 +259,6 @@ async function deduplicateAndDispatch(
         timestamp: new Date().toISOString(),
         data: eventData,
       })
-
-      // Record dispatched item in D1 to prevent double-dispatch
-      await env.DB.prepare(
-        `INSERT OR IGNORE INTO auto_imported_items (id, poster_client_id, fitkoh_user_id, fitkoh_menu_item_id, poster_product_name) VALUES (?, ?, ?, ?, ?)`,
-      ).bind(
-        item.id,
-        item.posterClientId,
-        0, // no longer FitKoh-specific, keep column for compat
-        item.fitkohMenuItemId ?? 0,
-        item.productName,
-      ).run()
 
       dispatched++
     } catch (err) {

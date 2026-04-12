@@ -53,6 +53,9 @@ app.post('/sync/:clockBookingId/reset', async (c) => {
 
 // Seed database (dev only)
 app.post('/seed', async (c) => {
+  if (c.env.ENVIRONMENT === 'production') {
+    return c.json({ error: 'Seed is disabled in production' }, 403)
+  }
   await seedDatabase(c.env.DB)
   return c.json({ ok: true, message: 'Database seeded with mock data' })
 })

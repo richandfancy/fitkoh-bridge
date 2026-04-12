@@ -9,17 +9,17 @@ import type { ClockClient } from './clock'
 const MOCK_GUESTS = [
   {
     title: 'Mr.',
-    first: 'Michael',
-    last: 'Grillhoesl',
-    phone: '+49 175 5871286',
-    email: 'michaelgrillhoesl@gmail.com',
+    first: 'Max',
+    last: 'Mustermann',
+    phone: '+49 555 0100001',
+    email: 'max.mustermann@example.com',
   },
   {
     title: 'Mr.',
-    first: 'Chris',
-    last: 'Heid',
-    phone: '+49 170 1234567',
-    email: 'heidca@gmail.com',
+    first: 'Thomas',
+    last: 'Schmidt',
+    phone: '+49 555 0100002',
+    email: 'thomas.schmidt@example.com',
   },
   {
     title: 'Mr.',
@@ -269,7 +269,7 @@ export async function seedDatabase(db: D1Database): Promise<void> {
   const bookingInserts = MOCK_BOOKINGS.map((b, i) => {
     // First 4 bookings linked to Poster clients; last 3 unlinked
     // Use real Poster client IDs for the first two to demo real meal data
-    const realPosterIds = [2512, 2495, 1002, 1003] // Michael Grillhoesl, Chris Heid, mock, mock
+    const realPosterIds = [2512, 2495, 1002, 1003] // Max Mustermann, Thomas Schmidt, mock, mock
     const posterClientId = i < 4 ? realPosterIds[i] : null
     return db
       .prepare(

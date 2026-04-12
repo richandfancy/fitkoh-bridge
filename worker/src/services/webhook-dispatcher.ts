@@ -64,24 +64,35 @@ export async function dispatchEvent(env: Env, event: BridgeEvent): Promise<{ dis
         ).bind(statusCode, sub.id).run()
         dispatched++
       } else {
-        const newFailureCount = sub.failure_count + 1
-        const shouldDisable = newFailureCount >= 10
-        await env.DB.prepare(
-          `UPDATE webhook_subscriptions SET last_triggered_at = datetime('now'), last_status_code = ?, failure_count = ?${shouldDisable ? ', active = 0' : ''} WHERE id = ?`
-        ).bind(statusCode, newFailureCount, sub.id).run()
+        // R2 fix: Use SQL increment instead of stale cached failure_count
+        const updateResult = await env.DB.prepare(
+          `UPDATE webhook_subscriptions
+           SET failure_count = failure_count + 1, last_triggered_at = datetime('now'), last_status_code = ?
+           WHERE id = ?
+           RETURNING failure_count`
+        ).bind(statusCode, sub.id).first<{ failure_count: number }>()
+
+        if (updateResult && updateResult.failure_count >= 10) {
+          await env.DB.prepare('UPDATE webhook_subscriptions SET active = 0 WHERE id = ?').bind(sub.id).run()
+          cachedSubscriptions = null
+        }
         failed++
-        // Clear cache so disabled sub isn't used next time
-        if (shouldDisable) cachedSubscriptions = null
       }
     } catch (err) {
       console.error(`Webhook dispatch to ${sub.url} failed:`, err)
-      const newFailureCount = sub.failure_count + 1
-      const shouldDisable = newFailureCount >= 10
-      await env.DB.prepare(
-        `UPDATE webhook_subscriptions SET last_triggered_at = datetime('now'), last_status_code = 0, failure_count = ?${shouldDisable ? ', active = 0' : ''} WHERE id = ?`
-      ).bind(newFailureCount, sub.id).run()
+      // R2 fix: Use SQL increment instead of stale cached failure_count
+      const updateResult = await env.DB.prepare(
+        `UPDATE webhook_subscriptions
+         SET failure_count = failure_count + 1, last_triggered_at = datetime('now'), last_status_code = 0
+         WHERE id = ?
+         RETURNING failure_count`
+      ).bind(sub.id).first<{ failure_count: number }>()
+
+      if (updateResult && updateResult.failure_count >= 10) {
+        await env.DB.prepare('UPDATE webhook_subscriptions SET active = 0 WHERE id = ?').bind(sub.id).run()
+        cachedSubscriptions = null
+      }
       failed++
-      if (shouldDisable) cachedSubscriptions = null
     }
   }
 

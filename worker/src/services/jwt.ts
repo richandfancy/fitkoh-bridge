@@ -13,10 +13,14 @@ export interface BridgeJwtPayload {
   exp: number
 }
 
-const DEV_FALLBACK_SECRET = 'dev-secret'
+const DEV_FALLBACK_SECRET = 'dev-secret-change-in-prod'
 
 function getSecret(env: Env): string {
-  return env.JWT_SECRET || DEV_FALLBACK_SECRET
+  if (!env.JWT_SECRET) {
+    if (env.ENVIRONMENT === 'production') throw new Error('JWT_SECRET must be set in production')
+    return DEV_FALLBACK_SECRET
+  }
+  return env.JWT_SECRET
 }
 
 function base64UrlEncode(data: Uint8Array | string): string {

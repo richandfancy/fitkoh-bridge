@@ -18,6 +18,21 @@ import type {
   PreInvoiceItem,
 } from '@shared/types'
 
+// Helper for batched parallel calls (P4 fix — avoids N+1 sequential API calls)
+async function processInBatches<T, R>(
+  items: T[],
+  batchSize: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = []
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize)
+    const batchResults = await Promise.all(batch.map(fn))
+    results.push(...batchResults)
+  }
+  return results
+}
+
 const app = new Hono<{ Bindings: Env }>()
 
 // Dashboard stats
@@ -77,7 +92,11 @@ app.get('/orders', async (c) => {
     }
   }
 
-  // Fallback: live Poster fetch (historical dates or stale KV)
+  // Fallback: live Poster fetch (historical dates or stale KV).
+  // NOTE (Q1): This fetch-and-flatten logic mirrors warmOrdersSnapshot() in
+  // cache-warmer.ts. The duplication is intentional — the cron warms KV for
+  // today's data (the hot path above), while this fallback handles historical
+  // dates and serves as a resilience path when KV is stale or unavailable.
   const poster = new PosterClient(c.env.POSTER_ACCESS_TOKEN)
 
   let transactions: Awaited<ReturnType<typeof poster.getDetailedTransactions>> = []
@@ -226,7 +245,8 @@ app.get('/guests/:id/meals', async (c) => {
     products.map((p) => [p.product_id, p.product_name]),
   )
 
-  // Fetch details for each transaction to get individual items with timestamps
+  // Fetch details for each transaction to get individual items with timestamps.
+  // Batched in groups of 5 to avoid N+1 sequential API calls (P4 fix).
   const allItems: Array<{
     date: string
     time: string
@@ -235,33 +255,37 @@ app.get('/guests/:id/meals', async (c) => {
     quantity: number
   }> = []
 
-  for (const txn of transactions) {
+  const histories = await processInBatches(transactions, 5, async (txn) => {
     try {
       const history = await poster.getTransactionHistory(txn.transaction_id)
-      for (const entry of history) {
-        if (entry.type_history !== 'additem') continue
-        const ts = Number(entry.time)
-        const dt = new Date(ts)
-        const name = productMap.get(entry.value) || `Product #${entry.value}`
-        // Parse price from value_text JSON
-        let price = 0
-        try {
-          const vt = JSON.parse(entry.value_text)
-          price = (vt.price || 0) / 100 // Poster prices in satang
-        } catch {
-          /* ignore */
-        }
-
-        allItems.push({
-          date: dt.toISOString().split('T')[0],
-          time: dt.toISOString(),
-          name: name.replace(/^food_/, ''),
-          price,
-          quantity: 1,
-        })
-      }
+      return history
     } catch {
-      // Skip failed transaction lookups
+      return []
+    }
+  })
+
+  for (const history of histories) {
+    for (const entry of history) {
+      if (entry.type_history !== 'additem') continue
+      const ts = Number(entry.time)
+      const dt = new Date(ts)
+      const name = productMap.get(entry.value) || `Product #${entry.value}`
+      // Parse price from value_text JSON
+      let price = 0
+      try {
+        const vt = JSON.parse(entry.value_text)
+        price = (vt.price || 0) / 100 // Poster prices in satang
+      } catch {
+        /* ignore */
+      }
+
+      allItems.push({
+        date: dt.toISOString().split('T')[0],
+        time: dt.toISOString(),
+        name: name.replace(/^food_/, ''),
+        price,
+        quantity: 1,
+      })
     }
   }
 
@@ -365,7 +389,8 @@ app.get('/pre-invoice/:posterClientId', async (c) => {
     products.map((p) => [p.product_id, p.product_name]),
   )
 
-  // Get all items with per-item timestamps from transaction history
+  // Get all items with per-item timestamps from transaction history.
+  // Batched in groups of 5 to avoid N+1 sequential API calls (P4 fix).
   const allItems: Array<{
     date: string
     name: string
@@ -373,30 +398,34 @@ app.get('/pre-invoice/:posterClientId', async (c) => {
     quantity: number
   }> = []
 
-  for (const txn of transactions) {
+  const details = await processInBatches(transactions, 5, async (txn) => {
     try {
       const [detail] = await poster.getTransaction(txn.transaction_id, true)
-      if (!detail?.products) continue
-
-      const txDate = txn.date_close_date?.split(' ')[0] || ''
-
-      for (const product of detail.products) {
-        const price = Number(product.product_price) / 100
-        if (price <= 0) continue
-
-        const name = (
-          productMap.get(product.product_id) || `Product #${product.product_id}`
-        ).replace(/^food_/, '')
-
-        allItems.push({
-          date: txDate,
-          name,
-          unitPrice: price,
-          quantity: Number(product.num) || 1,
-        })
-      }
+      return { detail, txn }
     } catch {
-      // Skip failed lookups
+      return { detail: null, txn }
+    }
+  })
+
+  for (const { detail, txn } of details) {
+    if (!detail?.products) continue
+
+    const txDate = txn.date_close_date?.split(' ')[0] || ''
+
+    for (const product of detail.products) {
+      const price = Number(product.product_price) / 100
+      if (price <= 0) continue
+
+      const name = (
+        productMap.get(product.product_id) || `Product #${product.product_id}`
+      ).replace(/^food_/, '')
+
+      allItems.push({
+        date: txDate,
+        name,
+        unitPrice: price,
+        quantity: Number(product.num) || 1,
+      })
     }
   }
 

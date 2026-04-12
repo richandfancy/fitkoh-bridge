@@ -12,6 +12,9 @@ import type { Env } from '../env'
  * In dev, if DOCS_PASSWORD is not set, we fall back to a dev password.
  */
 export const docsAuth = createMiddleware<{ Bindings: Env }>(async (c, next) => {
+  if (!c.env.DOCS_PASSWORD && c.env.ENVIRONMENT === 'production') {
+    throw new Error('DOCS_PASSWORD must be set in production')
+  }
   const expectedPassword = c.env.DOCS_PASSWORD || 'dev-docs-password'
 
   const authHeader = c.req.header('authorization')
