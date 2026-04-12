@@ -9,6 +9,7 @@ import {
   revokeApiKey,
 } from '../services/api-keys'
 import { warmMealsCache } from '../services/cache-warmer'
+import { autoImportNewMeals } from '../services/auto-importer'
 
 const app = new Hono<{ Bindings: Env }>()
 
@@ -78,6 +79,13 @@ app.post('/api-keys/:id/revoke', async (c) => {
 // need to force-refresh the cache without waiting for the next tick.
 app.post('/warm-cache', async (c) => {
   const result = await warmMealsCache(c.env)
+  return c.json(result)
+})
+
+// Manual auto-import trigger — runs the same logic as the cron handler.
+// Useful for testing and for forcing an immediate import.
+app.post('/auto-import', async (c) => {
+  const result = await autoImportNewMeals(c.env)
   return c.json(result)
 })
 

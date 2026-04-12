@@ -12,6 +12,7 @@ import v1 from './routes/v1'
 import stream from './routes/stream'
 import mcp from './routes/mcp'
 import { warmMealsCache } from './services/cache-warmer'
+import { autoImportNewMeals } from './services/auto-importer'
 
 const app = new Hono<{ Bindings: Env }>()
 
@@ -101,9 +102,14 @@ export default {
     ctx: ExecutionContext,
   ): Promise<void> {
     ctx.waitUntil(
-      warmMealsCache(env).catch((err) => {
-        console.error('Cache warm failed:', err)
-      }),
+      (async () => {
+        await warmMealsCache(env).catch((err) => {
+          console.error('Cache warm failed:', err)
+        })
+        await autoImportNewMeals(env).catch((err) => {
+          console.error('Auto-import failed:', err)
+        })
+      })(),
     )
   },
 }

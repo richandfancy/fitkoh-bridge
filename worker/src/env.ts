@@ -13,4 +13,8 @@ export interface Env {
   // Optional — HTTP Basic auth password for /docs and /api/v1/openapi.json.
   // Falls back to a dev password if unset.
   DOCS_PASSWORD?: string
+  // Optional — FitKoh auto-import config. When both are set, the cron trigger
+  // will auto-import Poster orders for mapped users into FitKoh.
+  FITKOH_API_URL?: string
+  FITKOH_API_KEY?: string
 }
