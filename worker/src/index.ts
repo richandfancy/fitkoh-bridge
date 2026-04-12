@@ -20,26 +20,27 @@ const app = new Hono<{ Bindings: Env }>()
 // CORS — only /api/v1/* and /mcp/* are browser-callable. Dashboard routes
 // stay same-origin only (no CORS), since they use cookie auth and are only
 // served from the bridge's own domain.
+// Localhost origins are only allowed in non-production environments.
 // ---------------------------------------------------------------------------
-const CORS_ALLOWED_ORIGINS = [
-  'https://fitkoh.app',
-  'https://s.fitkoh.app',
-  'http://localhost:5173',
-  'http://localhost:3000',
-]
+const PROD_ORIGINS = ['https://fitkoh.app', 'https://s.fitkoh.app']
+const DEV_ORIGINS = [...PROD_ORIGINS, 'http://localhost:5173', 'http://localhost:3000']
 
-const corsOptions = {
-  origin: (origin: string) =>
-    CORS_ALLOWED_ORIGINS.includes(origin) ? origin : null,
-  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
-  maxAge: 3600,
-  credentials: false,
+function createCorsMiddleware() {
+  return async (c: any, next: any) => {
+    const origins = c.env.ENVIRONMENT === 'production' ? PROD_ORIGINS : DEV_ORIGINS
+    return cors({
+      origin: (origin: string) => origins.includes(origin) ? origin : null,
+      allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+      allowHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
+      maxAge: 3600,
+      credentials: false,
+    })(c, next)
+  }
 }
 
-app.use('/api/v1/*', cors(corsOptions))
-app.use('/mcp', cors(corsOptions))
-app.use('/mcp/*', cors(corsOptions))
+app.use('/api/v1/*', createCorsMiddleware())
+app.use('/mcp', createCorsMiddleware())
+app.use('/mcp/*', createCorsMiddleware())
 
 // Health check
 app.get('/api/health', (c) => {

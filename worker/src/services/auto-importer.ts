@@ -262,6 +262,14 @@ async function deduplicateAndDispatch(
 
       dispatched++
     } catch (err) {
+      // If dispatch fails after the INSERT OR IGNORE claimed the item,
+      // delete the D1 row so it can be retried on the next cron/SSE tick.
+      await env.DB.prepare('DELETE FROM auto_imported_items WHERE id = ?')
+        .bind(item.id)
+        .run()
+        .catch((deleteErr) => {
+          console.error(`Failed to unclaim item ${item.id}:`, deleteErr)
+        })
       console.error(`Dispatch error for item ${item.id}:`, err)
       errors++
     }
