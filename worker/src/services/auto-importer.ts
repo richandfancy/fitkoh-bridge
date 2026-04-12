@@ -1,41 +1,44 @@
-// Auto-imports new Poster orders into FitKoh for users with linked accounts.
+// Auto-detects new Poster orders and dispatches them as webhook events.
 // Called by the Cloudflare Cron Trigger (after cache warming) and by
 // POST /api/admin/auto-import for manual testing.
 //
 // Two entry points:
-//   - autoImportNewMeals(env)       — cron path, fetches transactions from Poster
-//   - importItemsForUser(env, items) — SSE path, uses already-detected LiveItems
+//   - autoImportNewMeals(env)       -- cron path, fetches transactions from Poster
+//   - importItemsForUser(env, items) -- SSE path, uses already-detected LiveItems
 //
 // Flow:
-//   1. Load user mapping (poster_client_id → fitkohUserId) from KV
-//   2. Load item mapping (poster_product_id → fitkohMenuItemId) from KV
+//   1. Load user mapping (poster_client_id -> fitkohUserId) from KV
+//   2. Load item mapping (poster_product_id -> fitkohMenuItemId) from KV
 //   3. Fetch today's detailed transactions from Poster (cron) or use passed items (SSE)
-//   4. Filter to mapped users, map products to FitKoh menu items
+//   4. Filter to mapped users, map products
 //   5. Deduplicate against D1 (auto_imported_items table)
-//   6. POST new items to FitKoh's import endpoint
-//   7. Record imported items in D1
+//   6. Dispatch webhook events to all registered subscribers
+//   7. Record dispatched items in D1
 
 import type { Env } from '../env'
+import type { MealOrderedData } from '@shared/types'
 import { PosterClient } from './poster'
+import { dispatchEvent, generateEventId } from './webhook-dispatcher'
 
 interface UserMapping {
   fitkohUserId: number
   name: string
 }
 
-interface ImportableItem {
+interface DispatchableItem {
   id: string
   posterClientId: number
-  fitkohUserId: number
-  fitkohMenuItemId: number
+  posterProductId: string
   productName: string
-  logDate: string
+  quantity: number
+  price: number
+  fitkohMenuItemId: number | null
+  transactionId: number
   logTime: string
-  timeSlot: 'breakfast' | 'lunch' | 'dinner'
 }
 
 // ---------------------------------------------------------------------------
-// Module-level KV cache — avoids hammering KV every 2s from the SSE path
+// Module-level KV cache -- avoids hammering KV every 2s from the SSE path
 // ---------------------------------------------------------------------------
 
 let cachedUserMapping: Record<string, UserMapping> | null = null
@@ -65,37 +68,28 @@ async function getMappings(env: Env): Promise<{
   return { userMapping: cachedUserMapping, itemMapping: cachedItemMapping }
 }
 
-function determineTimeSlot(hour: number): 'breakfast' | 'lunch' | 'dinner' {
-  if (hour < 11) return 'breakfast'
-  if (hour < 15) return 'lunch'
-  return 'dinner'
-}
-
 export async function autoImportNewMeals(env: Env): Promise<{
   checked: number
-  imported: number
+  dispatched: number
   skipped: number
   errors: number
 }> {
-  const EMPTY = { checked: 0, imported: 0, skipped: 0, errors: 0 }
+  const EMPTY = { checked: 0, dispatched: 0, skipped: 0, errors: 0 }
 
-  // 1. Check if auto-import is configured
-  const fitkohUrl = env.FITKOH_API_URL
-  const fitkohKey = env.FITKOH_API_KEY
-  if (!fitkohUrl || !fitkohKey) return EMPTY
-
-  // 2. Load mappings from KV (cached)
+  // 1. Load mappings from KV (cached)
   const { userMapping, itemMapping } = await getMappings(env)
   if (!userMapping || !itemMapping) return EMPTY
 
-  // 4. Get today's date
+  const mappedClientIds = new Set(Object.keys(userMapping))
+
+  // 2. Get today's date
   const today = new Date().toISOString().split('T')[0]
 
-  // 5. Fetch today's detailed transactions from Poster
+  // 3. Fetch today's detailed transactions from Poster
   const poster = new PosterClient(env.POSTER_ACCESS_TOKEN)
   const transactions = await poster.getDetailedTransactions(today, today, 500)
 
-  // 6. Fetch product catalog ONCE (not per-item)
+  // 4. Fetch product catalog ONCE (not per-item)
   const products = await poster.getProducts()
   const productMap = new Map(
     products.map((p) => [
@@ -104,67 +98,58 @@ export async function autoImportNewMeals(env: Env): Promise<{
     ]),
   )
 
-  // 7. Find new items for mapped users
-  const mappedClientIds = new Set(Object.keys(userMapping))
-  const importableItems: ImportableItem[] = []
+  // 5. Find new items for mapped users
+  const dispatchableItems: DispatchableItem[] = []
 
   for (const t of transactions) {
     const clientIdStr = String(t.client_id)
     if (!mappedClientIds.has(clientIdStr)) continue
 
-    const user = userMapping[clientIdStr]
     for (let i = 0; i < (t.products || []).length; i++) {
       const p = t.products[i]
       const productIdStr = String(p.product_id)
-      const fitkohMenuItemId = itemMapping[productIdStr]
-      if (!fitkohMenuItemId) continue
+      const fitkohMenuItemId = itemMapping[productIdStr] ?? null
 
       const itemId = `${clientIdStr}:${t.transaction_id}:${i}`
 
-      // Determine time slot from date_close
+      // Build ISO timestamp (Poster date_close is in ICT, +07:00)
       const closeDateParts = (t.date_close || '').split(' ')
       const timeStr = closeDateParts[1] || '12:00:00'
-      const hour = parseInt(timeStr.split(':')[0] || '12')
-      const timeSlot = determineTimeSlot(hour)
-
-      // Build ISO timestamp (Poster date_close is in ICT, +07:00)
       const logTime = `${closeDateParts[0] || today}T${timeStr}+07:00`
 
       const productName =
         productMap.get(productIdStr) || `Product #${productIdStr}`
 
-      importableItems.push({
+      dispatchableItems.push({
         id: itemId,
         posterClientId: Number(clientIdStr),
-        fitkohUserId: user.fitkohUserId,
-        fitkohMenuItemId,
+        posterProductId: productIdStr,
         productName,
-        logDate: today,
+        quantity: Number(p.num || 1),
+        price: Number(p.product_sum || 0),
+        fitkohMenuItemId,
+        transactionId: t.transaction_id,
         logTime,
-        timeSlot,
       })
     }
   }
 
-  if (importableItems.length === 0) {
-    return { checked: transactions.length, imported: 0, skipped: 0, errors: 0 }
+  if (dispatchableItems.length === 0) {
+    return { checked: transactions.length, dispatched: 0, skipped: 0, errors: 0 }
   }
 
-  const { imported, errors } = await deduplicateAndImport(
-    env,
-    importableItems,
-  )
+  const { dispatched, errors } = await deduplicateAndDispatch(env, dispatchableItems)
 
   return {
     checked: transactions.length,
-    imported,
-    skipped: importableItems.length - imported - errors,
+    dispatched,
+    skipped: dispatchableItems.length - dispatched - errors,
     errors,
   }
 }
 
 // ---------------------------------------------------------------------------
-// SSE entry point — uses already-detected LiveItems from the stream
+// SSE entry point -- uses already-detected LiveItems from the stream
 // ---------------------------------------------------------------------------
 
 export async function importItemsForUser(
@@ -172,14 +157,14 @@ export async function importItemsForUser(
   newItems: Array<{
     id: string
     productId: number
+    productName: string
+    quantity: number
+    price: number
     time: string
     transactionId: number
     clientId?: number | null
   }>,
 ): Promise<number> {
-  const fitkohUrl = env.FITKOH_API_URL
-  const fitkohKey = env.FITKOH_API_KEY
-  if (!fitkohUrl || !fitkohKey) return 0
   if (newItems.length === 0) return 0
 
   const { userMapping, itemMapping } = await getMappings(env)
@@ -187,24 +172,14 @@ export async function importItemsForUser(
 
   const today = new Date().toISOString().split('T')[0]
   const mappedClientIds = new Set(Object.keys(userMapping))
-  const importableItems: ImportableItem[] = []
+  const dispatchableItems: DispatchableItem[] = []
 
   for (const item of newItems) {
     const clientIdStr = item.clientId != null ? String(item.clientId) : null
     if (!clientIdStr || !mappedClientIds.has(clientIdStr)) continue
 
     const productIdStr = String(item.productId)
-    const fitkohMenuItemId = itemMapping[productIdStr]
-    if (!fitkohMenuItemId) continue
-
-    const user = userMapping[clientIdStr]
-
-    // Determine time slot from the item's time (Poster date_close format)
-    const closeDateParts = (item.time || '').split(' ')
-    const timeStr = closeDateParts[1] || '12:00:00'
-    const hour = parseInt(timeStr.split(':')[0] || '12')
-    const timeSlot = determineTimeSlot(hour)
-    const logTime = `${closeDateParts[0] || today}T${timeStr}+07:00`
+    const fitkohMenuItemId = itemMapping[productIdStr] ?? null
 
     // Reconstruct the same dedup ID format used by the cron path:
     // clientId:transactionId:productIndex
@@ -213,114 +188,90 @@ export async function importItemsForUser(
     const productIndex = dashIdx >= 0 ? item.id.substring(dashIdx + 1) : '0'
     const dedupId = `${clientIdStr}:${item.transactionId}:${productIndex}`
 
-    importableItems.push({
+    // Build ISO timestamp (Poster date_close is in ICT, +07:00)
+    const closeDateParts = (item.time || '').split(' ')
+    const timeStr = closeDateParts[1] || '12:00:00'
+    const logTime = `${closeDateParts[0] || today}T${timeStr}+07:00`
+
+    dispatchableItems.push({
       id: dedupId,
       posterClientId: Number(clientIdStr),
-      fitkohUserId: user.fitkohUserId,
+      posterProductId: productIdStr,
+      productName: item.productName,
+      quantity: item.quantity,
+      price: item.price,
       fitkohMenuItemId,
-      productName: `Product #${productIdStr}`,
-      logDate: today,
+      transactionId: item.transactionId,
       logTime,
-      timeSlot,
     })
   }
 
-  if (importableItems.length === 0) return 0
+  if (dispatchableItems.length === 0) return 0
 
-  const { imported } = await deduplicateAndImport(env, importableItems)
-  return imported
+  const { dispatched } = await deduplicateAndDispatch(env, dispatchableItems)
+  return dispatched
 }
 
 // ---------------------------------------------------------------------------
-// Shared: dedup against D1 → POST to FitKoh → record in D1
+// Shared: dedup against D1 -> dispatch webhook events -> record in D1
 // ---------------------------------------------------------------------------
 
-async function deduplicateAndImport(
+async function deduplicateAndDispatch(
   env: Env,
-  importableItems: ImportableItem[],
-): Promise<{ imported: number; errors: number }> {
-  const fitkohUrl = env.FITKOH_API_URL!
-  const fitkohKey = env.FITKOH_API_KEY!
-
-  // Check which items are already imported (batch check)
-  const placeholders = importableItems.map(() => '?').join(',')
+  items: DispatchableItem[],
+): Promise<{ dispatched: number; errors: number }> {
+  // Check which items are already dispatched (batch check)
+  const placeholders = items.map(() => '?').join(',')
   const existing = await env.DB.prepare(
     `SELECT id FROM auto_imported_items WHERE id IN (${placeholders})`,
   )
-    .bind(...importableItems.map((i) => i.id))
+    .bind(...items.map((i) => i.id))
     .all<{ id: string }>()
   const existingIds = new Set(existing.results.map((r) => r.id))
 
-  const newItems = importableItems.filter((i) => !existingIds.has(i.id))
-  if (newItems.length === 0) return { imported: 0, errors: 0 }
+  const newItems = items.filter((i) => !existingIds.has(i.id))
+  if (newItems.length === 0) return { dispatched: 0, errors: 0 }
 
-  // Group by FitKoh user and import
-  const byUser = new Map<number, ImportableItem[]>()
-  for (const item of newItems) {
-    const items = byUser.get(item.fitkohUserId) || []
-    items.push(item)
-    byUser.set(item.fitkohUserId, items)
-  }
-
-  let imported = 0
+  let dispatched = 0
   let errors = 0
 
-  for (const [userId, items] of byUser) {
+  for (const item of newItems) {
     try {
-      const importPayload = {
-        userId,
-        items: items.map((i) => ({
-          menuItemId: i.fitkohMenuItemId,
-          logDate: i.logDate,
-          logTime: i.logTime,
-          timeSlot: i.timeSlot,
-          itemType: 'food',
-          quantity: 1,
-        })),
+      const eventData: MealOrderedData = {
+        posterClientId: item.posterClientId,
+        posterProductId: item.posterProductId,
+        productName: item.productName,
+        quantity: item.quantity,
+        price: item.price,
+        fitkohMenuItemId: item.fitkohMenuItemId,
+        transactionId: item.transactionId,
+        time: item.logTime,
       }
 
-      const resp = await fetch(`${fitkohUrl}/api/v1/items/import`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-API-Key': fitkohKey,
-        },
-        body: JSON.stringify(importPayload),
+      await dispatchEvent(env, {
+        id: generateEventId(),
+        type: 'meal.ordered',
+        timestamp: new Date().toISOString(),
+        data: eventData,
       })
 
-      if (!resp.ok) {
-        const body = await resp.text()
-        console.error(
-          `FitKoh import failed for user ${userId}: ${resp.status} ${body}`,
-        )
-        errors += items.length
-        continue
-      }
+      // Record dispatched item in D1 to prevent double-dispatch
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO auto_imported_items (id, poster_client_id, fitkoh_user_id, fitkoh_menu_item_id, poster_product_name) VALUES (?, ?, ?, ?, ?)`,
+      ).bind(
+        item.id,
+        item.posterClientId,
+        0, // no longer FitKoh-specific, keep column for compat
+        item.fitkohMenuItemId ?? 0,
+        item.productName,
+      ).run()
 
-      const result = (await resp.json()) as {
-        imported: number
-        skipped: number
-      }
-      imported += result.imported
-
-      // Record imported items in D1
-      const inserts = items.map((i) =>
-        env.DB.prepare(
-          `INSERT OR IGNORE INTO auto_imported_items (id, poster_client_id, fitkoh_user_id, fitkoh_menu_item_id, poster_product_name) VALUES (?, ?, ?, ?, ?)`,
-        ).bind(
-          i.id,
-          i.posterClientId,
-          i.fitkohUserId,
-          i.fitkohMenuItemId,
-          i.productName,
-        ),
-      )
-      await env.DB.batch(inserts)
+      dispatched++
     } catch (err) {
-      console.error(`Auto-import error for user ${userId}:`, err)
-      errors += items.length
+      console.error(`Dispatch error for item ${item.id}:`, err)
+      errors++
     }
   }
 
-  return { imported, errors }
+  return { dispatched, errors }
 }
