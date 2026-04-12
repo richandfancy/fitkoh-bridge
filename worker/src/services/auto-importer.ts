@@ -2,10 +2,14 @@
 // Called by the Cloudflare Cron Trigger (after cache warming) and by
 // POST /api/admin/auto-import for manual testing.
 //
+// Two entry points:
+//   - autoImportNewMeals(env)       — cron path, fetches transactions from Poster
+//   - importItemsForUser(env, items) — SSE path, uses already-detected LiveItems
+//
 // Flow:
 //   1. Load user mapping (poster_client_id → fitkohUserId) from KV
 //   2. Load item mapping (poster_product_id → fitkohMenuItemId) from KV
-//   3. Fetch today's detailed transactions from Poster
+//   3. Fetch today's detailed transactions from Poster (cron) or use passed items (SSE)
 //   4. Filter to mapped users, map products to FitKoh menu items
 //   5. Deduplicate against D1 (auto_imported_items table)
 //   6. POST new items to FitKoh's import endpoint
@@ -30,6 +34,37 @@ interface ImportableItem {
   timeSlot: 'breakfast' | 'lunch' | 'dinner'
 }
 
+// ---------------------------------------------------------------------------
+// Module-level KV cache — avoids hammering KV every 2s from the SSE path
+// ---------------------------------------------------------------------------
+
+let cachedUserMapping: Record<string, UserMapping> | null = null
+let cachedItemMapping: Record<string, number> | null = null
+let mappingsCachedAt = 0
+const MAPPING_CACHE_TTL = 60_000 // 1 minute
+
+async function getMappings(env: Env): Promise<{
+  userMapping: Record<string, UserMapping> | null
+  itemMapping: Record<string, number> | null
+}> {
+  const now = Date.now()
+  if (
+    cachedUserMapping &&
+    cachedItemMapping &&
+    now - mappingsCachedAt < MAPPING_CACHE_TTL
+  ) {
+    return { userMapping: cachedUserMapping, itemMapping: cachedItemMapping }
+  }
+  const [userRaw, itemRaw] = await Promise.all([
+    env.CONFIG.get('poster_to_fitkoh_users'),
+    env.CONFIG.get('poster_to_fitkoh_items'),
+  ])
+  cachedUserMapping = userRaw ? JSON.parse(userRaw) : null
+  cachedItemMapping = itemRaw ? JSON.parse(itemRaw) : null
+  mappingsCachedAt = now
+  return { userMapping: cachedUserMapping, itemMapping: cachedItemMapping }
+}
+
 function determineTimeSlot(hour: number): 'breakfast' | 'lunch' | 'dinner' {
   if (hour < 11) return 'breakfast'
   if (hour < 15) return 'lunch'
@@ -49,15 +84,9 @@ export async function autoImportNewMeals(env: Env): Promise<{
   const fitkohKey = env.FITKOH_API_KEY
   if (!fitkohUrl || !fitkohKey) return EMPTY
 
-  // 2. Load user mapping from KV
-  const userMappingRaw = await env.CONFIG.get('poster_to_fitkoh_users')
-  if (!userMappingRaw) return EMPTY
-  const userMapping: Record<string, UserMapping> = JSON.parse(userMappingRaw)
-
-  // 3. Load item mapping from KV
-  const itemMappingRaw = await env.CONFIG.get('poster_to_fitkoh_items')
-  if (!itemMappingRaw) return EMPTY
-  const itemMapping: Record<string, number> = JSON.parse(itemMappingRaw)
+  // 2. Load mappings from KV (cached)
+  const { userMapping, itemMapping } = await getMappings(env)
+  if (!userMapping || !itemMapping) return EMPTY
 
   // 4. Get today's date
   const today = new Date().toISOString().split('T')[0]
@@ -121,8 +150,99 @@ export async function autoImportNewMeals(env: Env): Promise<{
     return { checked: transactions.length, imported: 0, skipped: 0, errors: 0 }
   }
 
-  // 8. Check which items are already imported (batch check)
-  // Use parameterized query to avoid SQL injection
+  const { imported, errors } = await deduplicateAndImport(
+    env,
+    importableItems,
+  )
+
+  return {
+    checked: transactions.length,
+    imported,
+    skipped: importableItems.length - imported - errors,
+    errors,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SSE entry point — uses already-detected LiveItems from the stream
+// ---------------------------------------------------------------------------
+
+export async function importItemsForUser(
+  env: Env,
+  newItems: Array<{
+    id: string
+    productId: number
+    time: string
+    transactionId: number
+    clientId?: number | null
+  }>,
+): Promise<number> {
+  const fitkohUrl = env.FITKOH_API_URL
+  const fitkohKey = env.FITKOH_API_KEY
+  if (!fitkohUrl || !fitkohKey) return 0
+  if (newItems.length === 0) return 0
+
+  const { userMapping, itemMapping } = await getMappings(env)
+  if (!userMapping || !itemMapping) return 0
+
+  const today = new Date().toISOString().split('T')[0]
+  const mappedClientIds = new Set(Object.keys(userMapping))
+  const importableItems: ImportableItem[] = []
+
+  for (const item of newItems) {
+    const clientIdStr = item.clientId != null ? String(item.clientId) : null
+    if (!clientIdStr || !mappedClientIds.has(clientIdStr)) continue
+
+    const productIdStr = String(item.productId)
+    const fitkohMenuItemId = itemMapping[productIdStr]
+    if (!fitkohMenuItemId) continue
+
+    const user = userMapping[clientIdStr]
+
+    // Determine time slot from the item's time (Poster date_close format)
+    const closeDateParts = (item.time || '').split(' ')
+    const timeStr = closeDateParts[1] || '12:00:00'
+    const hour = parseInt(timeStr.split(':')[0] || '12')
+    const timeSlot = determineTimeSlot(hour)
+    const logTime = `${closeDateParts[0] || today}T${timeStr}+07:00`
+
+    // Reconstruct the same dedup ID format used by the cron path:
+    // clientId:transactionId:productIndex
+    // The SSE item id is "transactionId-productIndex", so extract the index
+    const dashIdx = item.id.lastIndexOf('-')
+    const productIndex = dashIdx >= 0 ? item.id.substring(dashIdx + 1) : '0'
+    const dedupId = `${clientIdStr}:${item.transactionId}:${productIndex}`
+
+    importableItems.push({
+      id: dedupId,
+      posterClientId: Number(clientIdStr),
+      fitkohUserId: user.fitkohUserId,
+      fitkohMenuItemId,
+      productName: `Product #${productIdStr}`,
+      logDate: today,
+      logTime,
+      timeSlot,
+    })
+  }
+
+  if (importableItems.length === 0) return 0
+
+  const { imported } = await deduplicateAndImport(env, importableItems)
+  return imported
+}
+
+// ---------------------------------------------------------------------------
+// Shared: dedup against D1 → POST to FitKoh → record in D1
+// ---------------------------------------------------------------------------
+
+async function deduplicateAndImport(
+  env: Env,
+  importableItems: ImportableItem[],
+): Promise<{ imported: number; errors: number }> {
+  const fitkohUrl = env.FITKOH_API_URL!
+  const fitkohKey = env.FITKOH_API_KEY!
+
+  // Check which items are already imported (batch check)
   const placeholders = importableItems.map(() => '?').join(',')
   const existing = await env.DB.prepare(
     `SELECT id FROM auto_imported_items WHERE id IN (${placeholders})`,
@@ -132,17 +252,9 @@ export async function autoImportNewMeals(env: Env): Promise<{
   const existingIds = new Set(existing.results.map((r) => r.id))
 
   const newItems = importableItems.filter((i) => !existingIds.has(i.id))
+  if (newItems.length === 0) return { imported: 0, errors: 0 }
 
-  if (newItems.length === 0) {
-    return {
-      checked: transactions.length,
-      imported: 0,
-      skipped: importableItems.length,
-      errors: 0,
-    }
-  }
-
-  // 9. Group by FitKoh user and import
+  // Group by FitKoh user and import
   const byUser = new Map<number, ImportableItem[]>()
   for (const item of newItems) {
     const items = byUser.get(item.fitkohUserId) || []
@@ -191,7 +303,7 @@ export async function autoImportNewMeals(env: Env): Promise<{
       }
       imported += result.imported
 
-      // 10. Record imported items in D1
+      // Record imported items in D1
       const inserts = items.map((i) =>
         env.DB.prepare(
           `INSERT OR IGNORE INTO auto_imported_items (id, poster_client_id, fitkoh_user_id, fitkoh_menu_item_id, poster_product_name) VALUES (?, ?, ?, ?, ?)`,
@@ -210,10 +322,5 @@ export async function autoImportNewMeals(env: Env): Promise<{
     }
   }
 
-  return {
-    checked: transactions.length,
-    imported,
-    skipped: importableItems.length - newItems.length,
-    errors,
-  }
+  return { imported, errors }
 }

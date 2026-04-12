@@ -19,6 +19,7 @@ import { streamSSE } from 'hono/streaming'
 import type { Env } from '../env'
 import { PosterClient } from '../services/poster'
 import { verifyApiKey } from '../services/api-keys'
+import { importItemsForUser } from '../services/auto-importer'
 
 const app = new OpenAPIHono<{ Bindings: Env }>()
 
@@ -46,6 +47,7 @@ type LiveItem = {
   table: number
   location: string
   clientName: string | null
+  clientId: number | null
   transactionId: number
 }
 
@@ -132,6 +134,7 @@ async function fetchTodayItems(env: Env): Promise<LiveItem[]> {
         table: t.table_id,
         location,
         clientName,
+        clientId: t.client_id || null,
         transactionId: t.transaction_id,
       })
     }
@@ -260,12 +263,21 @@ app.openapi(streamOrdersRoute, async (c) => {
 
       try {
         const items = await fetchTodayItems(c.env)
+        const newItemsThisTick: LiveItem[] = []
         for (const item of items) {
           if (seenIds.has(item.id)) continue
           seenIds.add(item.id)
+          newItemsThisTick.push(item)
           await stream.writeSSE({
             event: 'order_item',
             data: JSON.stringify(item),
+          })
+        }
+
+        // Fire-and-forget inline import for new items
+        if (newItemsThisTick.length > 0) {
+          importItemsForUser(c.env, newItemsThisTick).catch((err) => {
+            console.error('Inline import error:', err)
           })
         }
       } catch (err) {
