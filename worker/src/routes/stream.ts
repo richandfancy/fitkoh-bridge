@@ -20,6 +20,7 @@ import type { Env } from '../env'
 import { PosterClient } from '../services/poster'
 import { verifyApiKey } from '../services/api-keys'
 import { importItemsForUser } from '../services/auto-importer'
+import { verifySessionToken } from '../lib/crypto'
 
 const app = new OpenAPIHono<{ Bindings: Env }>()
 
@@ -66,7 +67,10 @@ async function isAuthorized(
     .find((s) => s.startsWith('bridge_session='))
     ?.split('=')[1]
 
-  if (sessionCookie && sessionCookie === env.DASHBOARD_SECRET) return true
+  if (sessionCookie) {
+    const valid = await verifySessionToken(env.DASHBOARD_SECRET, sessionCookie)
+    if (valid) return true
+  }
 
   if (queryApiKey) {
     const apiKey = await verifyApiKey(env.DB, queryApiKey)
@@ -77,10 +81,36 @@ async function isAuthorized(
 }
 
 // ---------------------------------------------------------------------------
-// Poster fetcher — returns today's flattened LiveItems sorted oldest → newest
+// Poster fetcher — returns today's flattened LiveItems sorted oldest → newest.
+//
+// Reads from the KV `live_orders_snapshot` that the cron warms every 60s.
+// Falls back to a live Poster fetch only if KV is stale (>90s) or missing.
+// This reduces Poster API calls from 90/min per SSE client to 3/min total.
 // ---------------------------------------------------------------------------
 
+// Max age (ms) before the KV snapshot is considered stale.
+const SNAPSHOT_MAX_AGE_MS = 90_000
+
 async function fetchTodayItems(env: Env): Promise<LiveItem[]> {
+  // Try KV snapshot first (populated by cron every 60s)
+  try {
+    const raw = await env.CONFIG.get('live_orders_snapshot')
+    if (raw) {
+      const data = JSON.parse(raw) as { items: LiveItem[]; updatedAt: string }
+      const age = Date.now() - new Date(data.updatedAt).getTime()
+      if (age < SNAPSHOT_MAX_AGE_MS) {
+        return data.items
+      }
+    }
+  } catch {
+    // KV read failed — fall through to live fetch
+  }
+
+  // Fallback: live Poster fetch (only if KV is stale or missing)
+  return fetchTodayItemsLive(env)
+}
+
+async function fetchTodayItemsLive(env: Env): Promise<LiveItem[]> {
   const poster = new PosterClient(env.POSTER_ACCESS_TOKEN)
   const today = new Date().toISOString().split('T')[0]
 

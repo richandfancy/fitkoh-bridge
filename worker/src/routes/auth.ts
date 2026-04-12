@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
 import type { Env } from '../env'
+import { createSessionToken, verifySessionToken } from '../lib/crypto'
 
 const auth = new Hono<{ Bindings: Env }>()
 
@@ -12,16 +13,20 @@ auth.post('/api/auth/login', async (c) => {
 
   const isProduction = c.env.ENVIRONMENT === 'production'
 
+  // Generate an HMAC-signed session token instead of storing the raw secret.
+  // The cookie value is opaque: `{timestamp}.{hmac_hex}`.
+  const sessionToken = await createSessionToken(c.env.DASHBOARD_SECRET)
+
   return c.json(
     { ok: true },
     200,
     {
       'Set-Cookie': [
-        `bridge_session=${c.env.DASHBOARD_SECRET}`,
+        `bridge_session=${sessionToken}`,
         'Path=/',
         'HttpOnly',
         'SameSite=Strict',
-        `Max-Age=${60 * 60 * 24 * 7}`, // 7 days
+        `Max-Age=${60 * 60 * 24 * 30}`, // 30 days (matches token expiry)
         isProduction ? 'Secure' : '',
       ]
         .filter(Boolean)
@@ -54,7 +59,12 @@ auth.get('/api/auth/check', async (c) => {
     .find((s) => s.startsWith('bridge_session='))
     ?.split('=')[1]
 
-  if (!sessionValue || sessionValue !== c.env.DASHBOARD_SECRET) {
+  if (!sessionValue) {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+
+  const valid = await verifySessionToken(c.env.DASHBOARD_SECRET, sessionValue)
+  if (!valid) {
     return c.json({ error: 'Unauthorized' }, 401)
   }
 

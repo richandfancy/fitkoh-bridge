@@ -11,7 +11,7 @@ import admin from './routes/admin'
 import v1 from './routes/v1'
 import stream from './routes/stream'
 import mcp from './routes/mcp'
-import { warmMealsCache } from './services/cache-warmer'
+import { warmMealsCache, warmOrdersSnapshot } from './services/cache-warmer'
 import { autoImportNewMeals } from './services/auto-importer'
 
 const app = new Hono<{ Bindings: Env }>()
@@ -80,7 +80,10 @@ app.route('/mcp', mcp)
 // Auth routes (login/logout/check — no middleware)
 app.route('/', auth)
 
-// Webhook routes (authenticated via their own mechanism)
+// Webhook routes — gated behind dashboard auth until real Clock PMS integration
+// goes live. When Clock credentials arrive, replace dashboardAuth with SNS
+// signature verification (validate the x-amz-sns-* headers + signing cert).
+app.use('/api/webhooks/*', dashboardAuth)
 app.route('/api/webhooks', webhooks)
 
 // Dashboard API routes (protected by cookie auth)
@@ -105,6 +108,9 @@ export default {
       (async () => {
         await warmMealsCache(env).catch((err) => {
           console.error('Cache warm failed:', err)
+        })
+        await warmOrdersSnapshot(env).catch((err) => {
+          console.error('Orders snapshot warm failed:', err)
         })
         await autoImportNewMeals(env).catch((err) => {
           console.error('Auto-import failed:', err)

@@ -13,6 +13,7 @@
 
 import type { Env } from '../env'
 import { fetchMealsForClient } from './meals-cache'
+import { PosterClient } from './poster'
 
 const CONCURRENCY = 5
 
@@ -89,4 +90,102 @@ export async function warmMealsCache(env: Env): Promise<{
     .run()
 
   return { warmed, errors, durationMs }
+}
+
+/**
+ * Warm the KV `live_orders_snapshot` key with today's flattened order items.
+ * Called by the cron trigger every 60s so SSE streams and the dashboard orders
+ * endpoint can read from KV (~5ms) instead of hitting Poster directly (3 API
+ * calls). This reduces Poster API usage from 90 calls/min per SSE client to
+ * 3 calls/min total regardless of how many clients are connected.
+ */
+export async function warmOrdersSnapshot(env: Env): Promise<void> {
+  const poster = new PosterClient(env.POSTER_ACCESS_TOKEN)
+  const today = new Date().toISOString().split('T')[0]
+
+  const [detailed, products, dashTxns] = await Promise.all([
+    poster.getDetailedTransactions(today, today, 500),
+    poster.getProducts(),
+    poster.getTransactions(
+      today.replace(/-/g, ''),
+      today.replace(/-/g, ''),
+    ),
+  ])
+
+  const productMap = new Map(
+    products.map((p) => [
+      String(p.product_id),
+      (p.product_name || '').replace(/^food_/, ''),
+    ]),
+  )
+
+  const clientNames = new Map<string, string>()
+  const spotNames = new Map<string, string>()
+  const dashArr = Array.isArray(dashTxns) ? dashTxns : []
+  for (const t of dashArr) {
+    if (
+      t.client_id &&
+      t.client_id !== '0' &&
+      (t.client_firstname || t.client_lastname)
+    ) {
+      clientNames.set(
+        t.client_id,
+        `${t.client_lastname || ''} ${t.client_firstname || ''}`.trim(),
+      )
+    }
+    if (t.spot_id && t.name) {
+      spotNames.set(String(t.spot_id), t.name.trim())
+    }
+  }
+
+  const items: Array<{
+    id: string
+    time: string
+    productId: number
+    productName: string
+    quantity: number
+    price: number
+    table: number
+    location: string
+    clientName: string | null
+    clientId: number | null
+    transactionId: number
+  }> = []
+
+  for (const t of detailed) {
+    const location = spotNames.get(String(t.spot_id)) || 'Unknown'
+    const clientName = clientNames.get(String(t.client_id)) || null
+
+    for (let i = 0; i < (t.products || []).length; i++) {
+      const p = t.products[i]
+      const productIdStr = String(p.product_id)
+      items.push({
+        id: `${t.transaction_id}-${i}`,
+        time: t.date_close,
+        productId: p.product_id,
+        productName:
+          productMap.get(productIdStr) || `Product #${productIdStr}`,
+        quantity: Number(p.num || 1),
+        price: Number(p.product_sum || 0),
+        table: t.table_id,
+        location,
+        clientName,
+        clientId: t.client_id || null,
+        transactionId: t.transaction_id,
+      })
+    }
+  }
+
+  items.sort((a, b) => a.time.localeCompare(b.time))
+
+  await env.CONFIG.put(
+    'live_orders_snapshot',
+    JSON.stringify({
+      date: today,
+      items,
+      updatedAt: new Date().toISOString(),
+      openOrders: dashArr.filter((t) => t.status === '1').length,
+      closedOrders: dashArr.filter((t) => t.status === '2').length,
+    }),
+  )
 }

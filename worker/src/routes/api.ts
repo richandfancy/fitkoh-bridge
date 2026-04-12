@@ -26,19 +26,65 @@ app.get('/stats', async (c) => {
   return c.json(stats)
 })
 
-// Live item feed from Poster — individual menu items as they're sold
+// Live item feed from Poster — individual menu items as they're sold.
+// For today's date, reads from the KV `live_orders_snapshot` (warmed by cron
+// every 60s) to avoid hitting Poster on every dashboard load. Falls back to
+// a live Poster fetch for historical dates or if KV is stale.
 app.get('/orders', async (c) => {
   const date = c.req.query('date') // YYYY-MM-DD optional, defaults to today
-  const poster = new PosterClient(c.env.POSTER_ACCESS_TOKEN)
+  const today = new Date().toISOString().split('T')[0]
+  const target = date || today
 
-  const target = date || new Date().toISOString().split('T')[0]
+  // Try KV snapshot for today's data
+  if (target === today) {
+    try {
+      const raw = await c.env.CONFIG.get('live_orders_snapshot')
+      if (raw) {
+        const snapshot = JSON.parse(raw) as {
+          date: string
+          items: Array<{
+            id: string
+            time: string
+            productId: number
+            productName: string
+            quantity: number
+            price: number
+            table: number
+            location: string
+            clientName: string | null
+            clientId: number | null
+            transactionId: number
+          }>
+          updatedAt: string
+          openOrders: number
+          closedOrders: number
+        }
+        const age = Date.now() - new Date(snapshot.updatedAt).getTime()
+        if (age < 90_000 && snapshot.date === today) {
+          // Return from KV — items are oldest-first, reverse for dashboard
+          const items = [...snapshot.items].reverse()
+          return c.json({
+            date: target,
+            totalItems: items.length,
+            openOrders: snapshot.openOrders,
+            closedOrders: snapshot.closedOrders,
+            items,
+          })
+        }
+      }
+    } catch {
+      // KV read failed — fall through to live fetch
+    }
+  }
+
+  // Fallback: live Poster fetch (historical dates or stale KV)
+  const poster = new PosterClient(c.env.POSTER_ACCESS_TOKEN)
 
   let transactions: Awaited<ReturnType<typeof poster.getDetailedTransactions>> = []
   let products: Awaited<ReturnType<typeof poster.getProducts>> = []
   let dashTxns: Awaited<ReturnType<typeof poster.getTransactions>> = []
 
   try {
-    // Fetch in parallel
     const [txnsResult, productsResult, dashResult] = await Promise.all([
       poster.getDetailedTransactions(target, target),
       poster.getProducts(),
@@ -56,7 +102,6 @@ app.get('/orders', async (c) => {
     )
   }
 
-  // Build product ID -> name map
   const productMap = new Map(
     products.map((p) => [
       String(p.product_id),
@@ -64,7 +109,6 @@ app.get('/orders', async (c) => {
     ]),
   )
 
-  // Build client ID -> name + spot ID -> location maps from dash transactions
   const clientNames = new Map<string, string>()
   const spotNames = new Map<string, string>()
   for (const t of dashTxns) {
@@ -79,7 +123,6 @@ app.get('/orders', async (c) => {
     }
   }
 
-  // Flatten transactions into individual items
   type LiveItem = {
     id: string
     time: string
@@ -117,10 +160,8 @@ app.get('/orders', async (c) => {
     }
   }
 
-  // Sort by time descending (newest first)
   items.sort((a, b) => b.time.localeCompare(a.time))
 
-  // Count open orders (from dash.getTransactions)
   const openOrders = dashTxns.filter((t) => t.status === '1').length
 
   return c.json({
