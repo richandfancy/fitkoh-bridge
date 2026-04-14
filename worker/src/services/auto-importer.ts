@@ -100,12 +100,19 @@ export async function autoImportNewMeals(env: Env): Promise<{
   // 2. Get today's date
   const today = new Date().toISOString().split('T')[0]
 
-  // 3. Fetch today's detailed transactions from Poster
+  // 3. Fetch today's transactions from Poster.
+  // Closed bills come from transactions.getTransactions with inline products.
+  // Open bills come from dash.getTransactions?status=1; we fetch per-line
+  // products separately for the mapped ones so a mapped diner's meal is
+  // dispatched the moment it's punched in, not when the bill closes.
   const poster = new PosterClient(env.POSTER_ACCESS_TOKEN)
-  const transactions = await poster.getDetailedTransactions(today, today, 500)
+  const todayCompact = today.replace(/-/g, '')
+  const [closedTxns, openTxns, products] = await Promise.all([
+    poster.getDetailedTransactions(today, today, 500),
+    poster.getOpenTransactions(todayCompact, todayCompact),
+    poster.getProducts(),
+  ])
 
-  // 4. Fetch product catalog ONCE (not per-item)
-  const products = await poster.getProducts()
   const productMap = new Map(
     products.map((p) => [
       String(p.product_id),
@@ -113,36 +120,37 @@ export async function autoImportNewMeals(env: Env): Promise<{
     ]),
   )
 
-  // 5. Find new items for mapped users. Each mapped transaction triggers one
-  // extra Poster call to fetch per-line punch-in times — cached per tick so a
-  // bill with N mapped products still costs just one extra call, not N.
+  // 4. Find new items for mapped users. Each mapped transaction triggers one
+  // extra Poster call to fetch per-line products + punch-in times — cached
+  // per tick so a bill with N mapped products still costs just one extra call.
   const dispatchableItems: DispatchableItem[] = []
-  const productTimesByTx = new Map<number, string[]>()
+  const productLinesByTx = new Map<number, Array<{ product_id: string; num: string; product_sum: string; time: string }>>()
 
-  for (const t of transactions) {
+  async function getLines(transactionId: number) {
+    let lines = productLinesByTx.get(transactionId)
+    if (!lines) {
+      lines = await poster.getTransactionProducts(transactionId)
+      productLinesByTx.set(transactionId, lines)
+    }
+    return lines
+  }
+
+  // 4a. Closed bills — product lines are inline on the transaction.
+  for (const t of closedTxns) {
     const clientIdStr = String(t.client_id)
     if (!mappedClientIds.has(clientIdStr)) continue
 
-    let productTimes = productTimesByTx.get(t.transaction_id)
-    if (!productTimes) {
-      const lines = await poster.getTransactionProducts(t.transaction_id)
-      productTimes = lines.map((l) => l.time)
-      productTimesByTx.set(t.transaction_id, productTimes)
-    }
+    const lines = await getLines(t.transaction_id)
+    const productTimes = lines.map((l) => l.time)
 
     for (let i = 0; i < (t.products || []).length; i++) {
       const p = t.products[i]
       const productIdStr = String(p.product_id)
       const fitkohMenuItemId = itemMapping[productIdStr] ?? null
-
-      const itemId = `${clientIdStr}:${t.transaction_id}:${i}`
-      const logTime = punchInIsoOrFallback(productTimes[i], t.date_close, today)
-
-      const productName =
-        productMap.get(productIdStr) || `Product #${productIdStr}`
+      const productName = productMap.get(productIdStr) || `Product #${productIdStr}`
 
       dispatchableItems.push({
-        id: itemId,
+        id: `${clientIdStr}:${t.transaction_id}:${i}`,
         posterClientId: Number(clientIdStr),
         posterProductId: productIdStr,
         productName,
@@ -150,19 +158,50 @@ export async function autoImportNewMeals(env: Env): Promise<{
         price: Number(p.product_sum || 0),
         fitkohMenuItemId,
         transactionId: t.transaction_id,
-        logTime,
+        logTime: punchInIsoOrFallback(productTimes[i], t.date_close, today),
       })
     }
   }
 
+  // 4b. Open bills — dash.getTransactions is bill-level only; fetch lines
+  // via dash.getTransactionProducts. Dedup (clientId:transactionId:index)
+  // guarantees no double-dispatch when the bill later appears as closed.
+  for (const t of openTxns) {
+    const clientIdStr = String(t.client_id)
+    if (!mappedClientIds.has(clientIdStr)) continue
+
+    const txId = Number(t.transaction_id)
+    const lines = await getLines(txId)
+
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i]
+      const productIdStr = String(l.product_id)
+      const fitkohMenuItemId = itemMapping[productIdStr] ?? null
+      const productName = productMap.get(productIdStr) || `Product #${productIdStr}`
+
+      dispatchableItems.push({
+        id: `${clientIdStr}:${txId}:${i}`,
+        posterClientId: Number(clientIdStr),
+        posterProductId: productIdStr,
+        productName,
+        quantity: Number(l.num || 1),
+        price: Number(l.product_sum || 0),
+        fitkohMenuItemId,
+        transactionId: txId,
+        logTime: punchInIsoOrFallback(l.time, undefined, today),
+      })
+    }
+  }
+
+  const totalChecked = closedTxns.length + openTxns.length
   if (dispatchableItems.length === 0) {
-    return { checked: transactions.length, dispatched: 0, skipped: 0, errors: 0 }
+    return { checked: totalChecked, dispatched: 0, skipped: 0, errors: 0 }
   }
 
   const { dispatched, errors } = await deduplicateAndDispatch(env, dispatchableItems)
 
   return {
-    checked: transactions.length,
+    checked: totalChecked,
     dispatched,
     skipped: dispatchableItems.length - dispatched - errors,
     errors,
