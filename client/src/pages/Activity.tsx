@@ -14,6 +14,7 @@ const FILTER_OPTIONS: { label: string; value: ActivityType | 'all' }[] = [
   { label: 'Guests Created', value: 'guest_created' },
   { label: 'Checkouts', value: 'checkout' },
   { label: 'Charges', value: 'charge_posted' },
+  { label: 'Cache Warmed', value: 'cache_warmed' },
   { label: 'Errors', value: 'error' },
 ]
 
@@ -22,6 +23,7 @@ const TYPE_LABELS: Record<ActivityType, string> = {
   guest_created: 'Guest Created',
   checkout: 'Checkout',
   charge_posted: 'Charge',
+  cache_warmed: 'Cache Warmed',
   error: 'Error',
 }
 
@@ -30,6 +32,7 @@ const DOT_COLORS: Record<ActivityType, string> = {
   guest_created: 'bg-status-green',
   checkout: 'bg-status-amber',
   charge_posted: 'bg-status-green',
+  cache_warmed: 'bg-status-blue',
   error: 'bg-status-red',
 }
 
