@@ -120,63 +120,35 @@ export async function autoImportNewMeals(env: Env): Promise<{
     ]),
   )
 
-  // 4. Find new items for mapped users. Each mapped transaction triggers one
-  // extra Poster call to fetch per-line products + punch-in times — cached
-  // per tick so a bill with N mapped products still costs just one extra call.
+  // 4. Find new items for mapped users.
+  //
+  // We used to cross-reference two Poster endpoints (transactions.getTransactions
+  // for products, dash.getTransactionProducts for times) by array index. That's
+  // broken: the two endpoints return the same products in OPPOSITE orders, so
+  // each line got the time of another line on the same bill.
+  //
+  // Fix: dash.getTransactionProducts is now the single source of truth for
+  // product_id + time + num + price. Lines are sorted by time ascending before
+  // assigning the positional index, which keeps dedup keys stable across ticks.
   const dispatchableItems: DispatchableItem[] = []
   const productLinesByTx = new Map<number, Array<{ product_id: string; num: string; product_sum: string; time: string }>>()
 
-  async function getLines(transactionId: number) {
+  async function getSortedLines(transactionId: number) {
     let lines = productLinesByTx.get(transactionId)
     if (!lines) {
-      lines = await poster.getTransactionProducts(transactionId)
+      const raw = await poster.getTransactionProducts(transactionId)
+      lines = [...raw].sort((a, b) => Number(a.time) - Number(b.time))
       productLinesByTx.set(transactionId, lines)
     }
     return lines
   }
 
-  // 4a. Closed bills — product lines are inline on the transaction.
-  for (const t of closedTxns) {
-    const clientIdStr = String(t.client_id)
-    if (!mappedClientIds.has(clientIdStr)) continue
-
-    const lines = await getLines(t.transaction_id)
-    const productTimes = lines.map((l) => l.time)
-
-    for (let i = 0; i < (t.products || []).length; i++) {
-      const p = t.products[i]
-      const productIdStr = String(p.product_id)
-      const fitkohMenuItemId = itemMapping[productIdStr] ?? null
-      const productName = productMap.get(productIdStr) || `Product #${productIdStr}`
-
-      dispatchableItems.push({
-        id: `${clientIdStr}:${t.transaction_id}:${i}`,
-        posterClientId: Number(clientIdStr),
-        posterProductId: productIdStr,
-        productName,
-        quantity: Number(p.num || 1),
-        price: Number(p.product_sum || 0),
-        fitkohMenuItemId,
-        transactionId: t.transaction_id,
-        logTime: punchInIsoOrFallback(productTimes[i], t.date_close, today),
-      })
-    }
-  }
-
-  // 4b. Open bills — dash.getTransactions is bill-level only; fetch lines
-  // via dash.getTransactionProducts. Dedup (clientId:transactionId:index)
-  // guarantees no double-dispatch when the bill later appears as closed.
-  for (const t of openTxns) {
-    const clientIdStr = String(t.client_id)
-    if (!mappedClientIds.has(clientIdStr)) continue
-
-    const txId = Number(t.transaction_id)
-    const lines = await getLines(txId)
-
+  const itemMap = itemMapping // narrow the ?null to a stable local ref for the inner fn
+  function buildItemsForBill(clientIdStr: string, txId: number, lines: Array<{ product_id: string; num: string; product_sum: string; time: string }>, dateCloseFallback: string | undefined) {
     for (let i = 0; i < lines.length; i++) {
       const l = lines[i]
       const productIdStr = String(l.product_id)
-      const fitkohMenuItemId = itemMapping[productIdStr] ?? null
+      const fitkohMenuItemId = itemMap[productIdStr] ?? null
       const productName = productMap.get(productIdStr) || `Product #${productIdStr}`
 
       dispatchableItems.push({
@@ -188,9 +160,30 @@ export async function autoImportNewMeals(env: Env): Promise<{
         price: Number(l.product_sum || 0),
         fitkohMenuItemId,
         transactionId: txId,
-        logTime: punchInIsoOrFallback(l.time, undefined, today),
+        logTime: punchInIsoOrFallback(l.time, dateCloseFallback, today),
       })
     }
+  }
+
+  // 4a. Closed bills.
+  for (const t of closedTxns) {
+    const clientIdStr = String(t.client_id)
+    if (!mappedClientIds.has(clientIdStr)) continue
+
+    const lines = await getSortedLines(t.transaction_id)
+    buildItemsForBill(clientIdStr, t.transaction_id, lines, t.date_close)
+  }
+
+  // 4b. Open bills — same path, dedup guarantees no redispatch when the bill
+  // later appears as closed (same transactionId, same product-index assignment
+  // because lines are deterministically sorted by time).
+  for (const t of openTxns) {
+    const clientIdStr = String(t.client_id)
+    if (!mappedClientIds.has(clientIdStr)) continue
+
+    const txId = Number(t.transaction_id)
+    const lines = await getSortedLines(txId)
+    buildItemsForBill(clientIdStr, txId, lines, undefined)
   }
 
   const totalChecked = closedTxns.length + openTxns.length
@@ -234,47 +227,53 @@ export async function importItemsForUser(
   const mappedClientIds = new Set(Object.keys(userMapping))
   const dispatchableItems: DispatchableItem[] = []
 
-  // The SSE stream carries bill-close time in `item.time`, not the punch-in
-  // time we want. Fetch per-line times for each transaction this call touches,
-  // cached so a bill with multiple mapped lines only costs one extra call.
+  // The SSE stream's payload is positionally unreliable (its productIndex was
+  // built from transactions.getTransactions order, which is the reverse of
+  // dash.getTransactionProducts). We ignore it and rebuild the full set of
+  // lines for each affected transaction from dash.getTransactionProducts,
+  // sorted by time so dedup indices match the cron path's indices.
   const poster = new PosterClient(env.POSTER_ACCESS_TOKEN)
-  const productTimesByTx = new Map<number, string[]>()
+  const linesByTx = new Map<number, Array<{ product_id: string; num: string; product_sum: string; time: string }>>()
+  const txsToFetch = new Set<number>()
 
   for (const item of newItems) {
     const clientIdStr = item.clientId != null ? String(item.clientId) : null
-    if (!clientIdStr || !mappedClientIds.has(clientIdStr)) continue
-
-    const productIdStr = String(item.productId)
-    const fitkohMenuItemId = itemMapping[productIdStr] ?? null
-
-    // Reconstruct the same dedup ID format used by the cron path:
-    // clientId:transactionId:productIndex
-    // The SSE item id is "transactionId-productIndex", so extract the index
-    const dashIdx = item.id.lastIndexOf('-')
-    const productIndexStr = dashIdx >= 0 ? item.id.substring(dashIdx + 1) : '0'
-    const productIndex = Number(productIndexStr)
-    const dedupId = `${clientIdStr}:${item.transactionId}:${productIndexStr}`
-
-    let productTimes = productTimesByTx.get(item.transactionId)
-    if (!productTimes) {
-      const lines = await poster.getTransactionProducts(item.transactionId)
-      productTimes = lines.map((l) => l.time)
-      productTimesByTx.set(item.transactionId, productTimes)
+    if (clientIdStr && mappedClientIds.has(clientIdStr)) {
+      txsToFetch.add(item.transactionId)
     }
+  }
 
-    const logTime = punchInIsoOrFallback(productTimes[productIndex], item.time, today)
+  const mappedClientByTx = new Map<number, string>()
+  for (const item of newItems) {
+    const clientIdStr = item.clientId != null ? String(item.clientId) : null
+    if (clientIdStr && mappedClientIds.has(clientIdStr)) {
+      mappedClientByTx.set(item.transactionId, clientIdStr)
+    }
+  }
 
-    dispatchableItems.push({
-      id: dedupId,
-      posterClientId: Number(clientIdStr),
-      posterProductId: productIdStr,
-      productName: item.productName,
-      quantity: item.quantity,
-      price: item.price,
-      fitkohMenuItemId,
-      transactionId: item.transactionId,
-      logTime,
-    })
+  for (const txId of txsToFetch) {
+    const raw = await poster.getTransactionProducts(txId)
+    const lines = [...raw].sort((a, b) => Number(a.time) - Number(b.time))
+    linesByTx.set(txId, lines)
+
+    const clientIdStr = mappedClientByTx.get(txId)!
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i]
+      const productIdStr = String(l.product_id)
+      const fitkohMenuItemId = itemMapping[productIdStr] ?? null
+
+      dispatchableItems.push({
+        id: `${clientIdStr}:${txId}:${i}`,
+        posterClientId: Number(clientIdStr),
+        posterProductId: productIdStr,
+        productName: `Product #${productIdStr}`,
+        quantity: Number(l.num || 1),
+        price: Number(l.product_sum || 0),
+        fitkohMenuItemId,
+        transactionId: txId,
+        logTime: punchInIsoOrFallback(l.time, undefined, today),
+      })
+    }
   }
 
   if (dispatchableItems.length === 0) return 0
