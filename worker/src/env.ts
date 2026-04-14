@@ -13,4 +13,9 @@ export interface Env {
   // Optional — HTTP Basic auth password for /docs and /api/v1/openapi.json.
   // Falls back to a dev password if unset.
   DOCS_PASSWORD?: string
+  // FitKoh trainer endpoint — bridge dispatches meal.ordered events as a
+  // FitKoh trainer user (BAC-1068) instead of a custom webhook. These are
+  // required in production; if unset, auto-import will log and skip dispatch.
+  FITKOH_API_URL?: string
+  FITKOH_API_KEY?: string
 }

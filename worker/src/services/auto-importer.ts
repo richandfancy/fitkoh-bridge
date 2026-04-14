@@ -16,9 +16,7 @@
 //   7. Record dispatched items in D1
 
 import type { Env } from '../env'
-import type { MealOrderedData } from '@shared/types'
 import { PosterClient } from './poster'
-import { dispatchEvent, generateEventId } from './webhook-dispatcher'
 
 interface UserMapping {
   fitkohUserId: number
@@ -33,6 +31,7 @@ interface DispatchableItem {
   quantity: number
   price: number
   fitkohMenuItemId: number | null
+  fitkohUserId: number
   transactionId: number
   logTime: string
 }
@@ -144,7 +143,10 @@ export async function autoImportNewMeals(env: Env): Promise<{
   }
 
   const itemMap = itemMapping // narrow the ?null to a stable local ref for the inner fn
+  const userMap = userMapping
   function buildItemsForBill(clientIdStr: string, txId: number, lines: Array<{ product_id: string; num: string; product_sum: string; time: string }>, dateCloseFallback: string | undefined) {
+    const fitkohUserId = userMap[clientIdStr]?.fitkohUserId
+    if (!fitkohUserId) return // defensive: mappedClientIds was derived from userMap; this should never trigger
     for (let i = 0; i < lines.length; i++) {
       const l = lines[i]
       const productIdStr = String(l.product_id)
@@ -159,6 +161,7 @@ export async function autoImportNewMeals(env: Env): Promise<{
         quantity: Number(l.num || 1),
         price: Number(l.product_sum || 0),
         fitkohMenuItemId,
+        fitkohUserId,
         transactionId: txId,
         logTime: punchInIsoOrFallback(l.time, dateCloseFallback, today),
       })
@@ -257,6 +260,8 @@ export async function importItemsForUser(
     linesByTx.set(txId, lines)
 
     const clientIdStr = mappedClientByTx.get(txId)!
+    const fitkohUserId = userMapping[clientIdStr]?.fitkohUserId
+    if (!fitkohUserId) continue
     for (let i = 0; i < lines.length; i++) {
       const l = lines[i]
       const productIdStr = String(l.product_id)
@@ -270,6 +275,7 @@ export async function importItemsForUser(
         quantity: Number(l.num || 1),
         price: Number(l.product_sum || 0),
         fitkohMenuItemId,
+        fitkohUserId,
         transactionId: txId,
         logTime: punchInIsoOrFallback(l.time, undefined, today),
       })
@@ -283,8 +289,53 @@ export async function importItemsForUser(
 }
 
 // ---------------------------------------------------------------------------
-// Shared: dedup against D1 -> dispatch webhook events -> record in D1
+// Shared: dedup against D1 -> log to FitKoh trainer endpoint -> record in D1
+//
+// BAC-1068: The bridge authenticates to FitKoh as a trainer user (via
+// X-API-Key on tRPC), and calls collaborate.logItemForClient directly.
+// Replaces the previous webhook dispatcher: one auth model, one permissions
+// model (shared_access), one audit trail per FitKoh's user table.
 // ---------------------------------------------------------------------------
+
+async function logToFitkoh(
+  env: Env,
+  item: DispatchableItem,
+): Promise<void> {
+  if (!env.FITKOH_API_URL || !env.FITKOH_API_KEY) {
+    throw new Error('FITKOH_API_URL / FITKOH_API_KEY not configured')
+  }
+  if (item.fitkohMenuItemId == null) {
+    // No menu mapping — nothing to log. Treated as success so the dedup
+    // row stays claimed and we don't re-try every tick for unmapped items.
+    return
+  }
+  const logDate = item.logTime.slice(0, 10)
+  const body = {
+    json: {
+      ownerId: item.fitkohUserId,
+      menuItemId: item.fitkohMenuItemId,
+      logDate,
+      logTime: item.logTime,
+      quantity: item.quantity || 1,
+      itemType: 'food',
+    },
+  }
+  const resp = await fetch(
+    `${env.FITKOH_API_URL}/api/trpc/collaborate.logItemForClient`,
+    {
+      method: 'POST',
+      headers: {
+        'x-api-key': env.FITKOH_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    },
+  )
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '')
+    throw new Error(`FitKoh logItemForClient ${resp.status}: ${text.slice(0, 200)}`)
+  }
+}
 
 async function deduplicateAndDispatch(
   env: Env,
@@ -311,25 +362,8 @@ async function deduplicateAndDispatch(
 
       if (result.meta.changes === 0) continue // Already dispatched by another path
 
-      // This is genuinely new -- dispatch webhook
-      const eventData: MealOrderedData = {
-        posterClientId: item.posterClientId,
-        posterProductId: item.posterProductId,
-        productName: item.productName,
-        quantity: item.quantity,
-        price: item.price,
-        fitkohMenuItemId: item.fitkohMenuItemId,
-        transactionId: item.transactionId,
-        time: item.logTime,
-      }
-
-      await dispatchEvent(env, {
-        id: generateEventId(),
-        type: 'meal.ordered',
-        timestamp: new Date().toISOString(),
-        data: eventData,
-      })
-
+      // This is genuinely new — log directly to FitKoh as the bridge trainer.
+      await logToFitkoh(env, item)
       dispatched++
     } catch (err) {
       // If dispatch fails after the INSERT OR IGNORE claimed the item,
