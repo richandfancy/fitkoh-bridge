@@ -41,6 +41,21 @@ interface DispatchableItem {
 // Module-level KV cache -- avoids hammering KV every 2s from the SSE path
 // ---------------------------------------------------------------------------
 
+// Convert a Poster per-line punch-in timestamp (unix ms as string) to an ISO
+// instant. If the line is missing a time, fall back to the bill close time
+// (date_close is " YYYY-MM-DD HH:MM:SS " in ICT +07:00).
+function punchInIsoOrFallback(
+  punchInMs: string | undefined,
+  dateCloseIct: string | undefined,
+  today: string,
+): string {
+  const ms = Number(punchInMs)
+  if (Number.isFinite(ms) && ms > 0) return new Date(ms).toISOString()
+  const parts = (dateCloseIct || '').split(' ')
+  const timeStr = parts[1] || '12:00:00'
+  return `${parts[0] || today}T${timeStr}+07:00`
+}
+
 let cachedUserMapping: Record<string, UserMapping> | null = null
 let cachedItemMapping: Record<string, number> | null = null
 let mappingsCachedAt = 0
@@ -98,12 +113,22 @@ export async function autoImportNewMeals(env: Env): Promise<{
     ]),
   )
 
-  // 5. Find new items for mapped users
+  // 5. Find new items for mapped users. Each mapped transaction triggers one
+  // extra Poster call to fetch per-line punch-in times — cached per tick so a
+  // bill with N mapped products still costs just one extra call, not N.
   const dispatchableItems: DispatchableItem[] = []
+  const productTimesByTx = new Map<number, string[]>()
 
   for (const t of transactions) {
     const clientIdStr = String(t.client_id)
     if (!mappedClientIds.has(clientIdStr)) continue
+
+    let productTimes = productTimesByTx.get(t.transaction_id)
+    if (!productTimes) {
+      const lines = await poster.getTransactionProducts(t.transaction_id)
+      productTimes = lines.map((l) => l.time)
+      productTimesByTx.set(t.transaction_id, productTimes)
+    }
 
     for (let i = 0; i < (t.products || []).length; i++) {
       const p = t.products[i]
@@ -111,11 +136,7 @@ export async function autoImportNewMeals(env: Env): Promise<{
       const fitkohMenuItemId = itemMapping[productIdStr] ?? null
 
       const itemId = `${clientIdStr}:${t.transaction_id}:${i}`
-
-      // Build ISO timestamp (Poster date_close is in ICT, +07:00)
-      const closeDateParts = (t.date_close || '').split(' ')
-      const timeStr = closeDateParts[1] || '12:00:00'
-      const logTime = `${closeDateParts[0] || today}T${timeStr}+07:00`
+      const logTime = punchInIsoOrFallback(productTimes[i], t.date_close, today)
 
       const productName =
         productMap.get(productIdStr) || `Product #${productIdStr}`
@@ -174,6 +195,12 @@ export async function importItemsForUser(
   const mappedClientIds = new Set(Object.keys(userMapping))
   const dispatchableItems: DispatchableItem[] = []
 
+  // The SSE stream carries bill-close time in `item.time`, not the punch-in
+  // time we want. Fetch per-line times for each transaction this call touches,
+  // cached so a bill with multiple mapped lines only costs one extra call.
+  const poster = new PosterClient(env.POSTER_ACCESS_TOKEN)
+  const productTimesByTx = new Map<number, string[]>()
+
   for (const item of newItems) {
     const clientIdStr = item.clientId != null ? String(item.clientId) : null
     if (!clientIdStr || !mappedClientIds.has(clientIdStr)) continue
@@ -185,13 +212,18 @@ export async function importItemsForUser(
     // clientId:transactionId:productIndex
     // The SSE item id is "transactionId-productIndex", so extract the index
     const dashIdx = item.id.lastIndexOf('-')
-    const productIndex = dashIdx >= 0 ? item.id.substring(dashIdx + 1) : '0'
-    const dedupId = `${clientIdStr}:${item.transactionId}:${productIndex}`
+    const productIndexStr = dashIdx >= 0 ? item.id.substring(dashIdx + 1) : '0'
+    const productIndex = Number(productIndexStr)
+    const dedupId = `${clientIdStr}:${item.transactionId}:${productIndexStr}`
 
-    // Build ISO timestamp (Poster date_close is in ICT, +07:00)
-    const closeDateParts = (item.time || '').split(' ')
-    const timeStr = closeDateParts[1] || '12:00:00'
-    const logTime = `${closeDateParts[0] || today}T${timeStr}+07:00`
+    let productTimes = productTimesByTx.get(item.transactionId)
+    if (!productTimes) {
+      const lines = await poster.getTransactionProducts(item.transactionId)
+      productTimes = lines.map((l) => l.time)
+      productTimesByTx.set(item.transactionId, productTimes)
+    }
+
+    const logTime = punchInIsoOrFallback(productTimes[productIndex], item.time, today)
 
     dispatchableItems.push({
       id: dedupId,
