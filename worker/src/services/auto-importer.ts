@@ -318,6 +318,10 @@ async function logToFitkoh(
       logTime: item.logTime,
       quantity: item.quantity || 1,
       itemType: 'food',
+      // BAC-1071: idempotency key, identical to this row's bridge D1 id
+      // (`clientId:txId:lineIndex`). Retries after a lost response resolve
+      // to the same FitKoh row via ON CONFLICT DO NOTHING on source_id.
+      sourceId: `poster:${item.id}`,
     },
   }
   const resp = await fetch(
