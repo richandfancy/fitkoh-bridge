@@ -137,6 +137,32 @@ export class PosterClient {
     return result
   }
 
+  // Per-line products for a single transaction. The `time` field is the
+  // unix-ms punch-in timestamp for each line (when the waiter tapped it in),
+  // which is what FitKoh needs for macro bucketing — not the bill close time.
+  async getTransactionProducts(
+    transactionId: number,
+  ): Promise<
+    Array<{
+      product_id: string
+      num: string
+      product_sum: string
+      time: string
+    }>
+  > {
+    const result = await this.request<
+      Array<{
+        product_id: string
+        num: string
+        product_sum: string
+        time: string
+      }>
+    >('dash.getTransactionProducts', {
+      transaction_id: String(transactionId),
+    })
+    return result || []
+  }
+
   // Detailed transactions with inline products — used for live item feed
   async getDetailedTransactions(
     dateFrom: string,
