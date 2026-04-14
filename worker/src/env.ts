@@ -18,4 +18,9 @@ export interface Env {
   // required in production; if unset, auto-import will log and skip dispatch.
   FITKOH_API_URL?: string
   FITKOH_API_KEY?: string
+  // Comma-separated list of admin emails allowed to sign in to the dashboard
+  // via magic link (BAC-1080). Case-insensitive; callers should lowercase
+  // before comparing. Required in production — if unset, request-link will
+  // refuse all requests.
+  BRIDGE_ADMIN_EMAILS?: string
 }

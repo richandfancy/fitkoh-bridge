@@ -1,10 +1,14 @@
 import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react'
 import { api } from '@/lib/api'
 
+type RequestLinkResult =
+  | { ok: true }
+  | { ok: false; error: 'rate_limited' | 'invalid_email' | 'send_failed' | 'unknown' }
+
 interface AuthContextValue {
   isAuthenticated: boolean
   isLoading: boolean
-  login: (secret: string) => Promise<boolean>
+  requestMagicLink: (email: string) => Promise<RequestLinkResult>
   logout: () => Promise<void>
 }
 
@@ -29,13 +33,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener('auth:logout', handler)
   }, [])
 
-  const login = useCallback(async (secret: string): Promise<boolean> => {
+  const requestMagicLink = useCallback(async (email: string): Promise<RequestLinkResult> => {
     try {
-      await api.post('/api/auth/login', { secret })
-      setIsAuthenticated(true)
-      return true
+      const resp = await fetch('/api/auth/request-link', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      })
+
+      if (resp.ok) {
+        return { ok: true }
+      }
+
+      const body = (await resp.json().catch(() => ({}))) as { error?: string }
+      const code = body.error
+      if (code === 'rate_limited' || code === 'invalid_email' || code === 'send_failed') {
+        return { ok: false, error: code }
+      }
+      return { ok: false, error: 'unknown' }
     } catch {
-      return false
+      return { ok: false, error: 'unknown' }
     }
   }, [])
 
@@ -45,7 +63,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   return (
-    <AuthContext.Provider value={{ isAuthenticated, isLoading, login, logout }}>
+    <AuthContext.Provider value={{ isAuthenticated, isLoading, requestMagicLink, logout }}>
       {children}
     </AuthContext.Provider>
   )
