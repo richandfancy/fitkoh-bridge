@@ -15,7 +15,9 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
+    "@hono/zod-openapi": "^1.2.4",
     "@hono/zod-validator": "^0.7.6",
+    "@scalar/hono-api-reference": "^0.10.7",
     "clsx": "^2.1.1",
     "hono": "^4.12.3",
     "lucide-react": "^0.575.0",

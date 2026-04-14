@@ -1,3 +1,41 @@
+// Bridge webhook events
+export type BridgeEventType =
+  | 'meal.ordered'
+  | 'guest.synced'
+  | 'invoice.transferred'
+  | 'error.occurred'
+
+export interface BridgeEvent<T = unknown> {
+  id: string              // unique event ID (uuid or timestamp-based)
+  type: BridgeEventType
+  timestamp: string        // ISO 8601
+  data: T
+}
+
+export interface MealOrderedData {
+  posterClientId: number
+  posterProductId: string
+  productName: string
+  quantity: number
+  price: number
+  fitkohMenuItemId: number | null
+  transactionId: number
+  time: string             // when the item was ordered
+}
+
+export interface WebhookSubscription {
+  id: number
+  url: string
+  events: string           // JSON array
+  secret: string            // HMAC-SHA256 signing secret
+  description: string | null
+  active: number
+  created_at: string
+  last_triggered_at: string | null
+  last_status_code: number | null
+  failure_count: number
+}
+
 // Activity types
 export type ActivityType =
   | 'booking_new'

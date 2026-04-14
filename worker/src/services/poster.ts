@@ -4,6 +4,21 @@ import type {
   PosterTransactionHistoryEntry,
 } from '@shared/types'
 
+// Module-level cache for products (P2 fix)
+let cachedProducts: Array<{
+  product_id: string
+  product_name: string
+  category_name: string
+  price: Record<string, string> | string
+}> | null = null
+let productsCachedAt = 0
+const PRODUCTS_CACHE_TTL = 5 * 60 * 1000 // 5 minutes
+
+// Module-level cache for daily transactions (P3 fix)
+let cachedTransactions: { date: string; data: PosterTransaction[] } | null = null
+let transactionsCachedAt = 0
+const TRANSACTIONS_CACHE_TTL = 30_000 // 30 seconds
+
 export class PosterClient {
   private token: string
   private baseUrl = 'https://joinposter.com/api/'
@@ -105,7 +120,47 @@ export class PosterClient {
       price: Record<string, string> | string
     }>
   > {
-    return this.request('menu.getProducts')
+    const now = Date.now()
+    if (cachedProducts && now - productsCachedAt < PRODUCTS_CACHE_TTL) {
+      return cachedProducts
+    }
+    const result = await this.request<
+      Array<{
+        product_id: string
+        product_name: string
+        category_name: string
+        price: Record<string, string> | string
+      }>
+    >('menu.getProducts')
+    cachedProducts = result
+    productsCachedAt = now
+    return result
+  }
+
+  // Per-line products for a single transaction. The `time` field is the
+  // unix-ms punch-in timestamp for each line (when the waiter tapped it in),
+  // which is what FitKoh needs for macro bucketing — not the bill close time.
+  async getTransactionProducts(
+    transactionId: number,
+  ): Promise<
+    Array<{
+      product_id: string
+      num: string
+      product_sum: string
+      time: string
+    }>
+  > {
+    const result = await this.request<
+      Array<{
+        product_id: string
+        num: string
+        product_sum: string
+        time: string
+      }>
+    >('dash.getTransactionProducts', {
+      transaction_id: String(transactionId),
+    })
+    return result || []
   }
 
   // Detailed transactions with inline products — used for live item feed
@@ -148,14 +203,32 @@ export class PosterClient {
     return raw?.data || []
   }
 
-  // For pre-invoice: get all transactions for a specific client in a date range
+  // For pre-invoice: get all transactions for a specific client in a date range.
+  // The Poster API doesn't support client_id filtering, so we fetch all
+  // transactions for the date range and filter locally. Results are cached
+  // for 30s to avoid redundant full downloads (P3 fix).
   async getClientTransactions(
     clientId: number,
     dateFrom: string,
     dateTo: string,
   ): Promise<PosterTransaction[]> {
-    const allTxns = await this.getTransactions(dateFrom, dateTo)
-    if (!allTxns || !Array.isArray(allTxns)) return []
+    const cacheKey = `${dateFrom}-${dateTo}`
+    const now = Date.now()
+    let allTxns: PosterTransaction[]
+
+    if (
+      cachedTransactions &&
+      cachedTransactions.date === cacheKey &&
+      now - transactionsCachedAt < TRANSACTIONS_CACHE_TTL
+    ) {
+      allTxns = cachedTransactions.data
+    } else {
+      allTxns = await this.getTransactions(dateFrom, dateTo)
+      if (!allTxns || !Array.isArray(allTxns)) return []
+      cachedTransactions = { date: cacheKey, data: allTxns }
+      transactionsCachedAt = now
+    }
+
     return allTxns.filter((t) => t.client_id === String(clientId))
   }
 }

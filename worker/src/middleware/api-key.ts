@@ -1,9 +1,13 @@
 import { createMiddleware } from 'hono/factory'
 import type { Env } from '../env'
 import { verifyApiKey, type ApiKey } from '../services/api-keys'
+import { verifyJwt, type BridgeJwtPayload } from '../services/jwt'
 
+// V1 auth context — a request is either authenticated via an API key OR a
+// bridge JWT. Downstream handlers can inspect both to decide scope/access.
 export type V1Variables = {
-  apiKey: ApiKey
+  apiKey?: ApiKey
+  jwt?: BridgeJwtPayload
 }
 
 export const apiKeyAuth = createMiddleware<{
@@ -12,15 +16,31 @@ export const apiKeyAuth = createMiddleware<{
 }>(async (c, next) => {
   const headerKey = c.req.header('x-api-key')
   const authHeader = c.req.header('authorization')
-  const bearerKey = authHeader?.startsWith('Bearer ')
+  const bearerToken = authHeader?.startsWith('Bearer ')
     ? authHeader.slice(7)
     : null
 
-  const key = headerKey || bearerKey
+  // 1. Try JWT first if the bearer token looks like one (starts with "ey").
+  //    JWTs are the preferred browser-side auth (via /api/v1/auth/token).
+  if (bearerToken && bearerToken.startsWith('ey')) {
+    const payload = await verifyJwt(c.env, bearerToken)
+    if (payload) {
+      c.set('jwt', payload)
+      return next()
+    }
+    // Fall through — maybe it happens to start with "ey" but is actually a key.
+  }
+
+  // 2. Fall back to API key auth (either X-API-Key header or Bearer fbk_...).
+  const key =
+    headerKey || (bearerToken?.startsWith('fbk_') ? bearerToken : null)
 
   if (!key) {
     return c.json(
-      { error: 'Missing API key. Provide via X-API-Key header or Bearer token.' },
+      {
+        error:
+          'Missing API key or JWT. Provide via X-API-Key header or Authorization: Bearer.',
+      },
       401,
     )
   }
@@ -30,7 +50,6 @@ export const apiKeyAuth = createMiddleware<{
     return c.json({ error: 'Invalid or revoked API key' }, 401)
   }
 
-  // Attach to context for downstream handlers
   c.set('apiKey', apiKey)
   await next()
 })
