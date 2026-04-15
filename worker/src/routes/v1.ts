@@ -7,6 +7,7 @@ import type { Env } from '../env'
 import { apiKeyAuth, type V1Variables } from '../middleware/api-key'
 import { getCachedOrFetchMeals } from '../services/meals-cache'
 import { signJwt } from '../services/jwt'
+import { syncUserFromPoster } from '../services/sync-user'
 import { streamOrdersRoute } from './stream'
 
 const app = new OpenAPIHono<{ Bindings: Env; Variables: V1Variables }>()
@@ -399,6 +400,109 @@ app.openapi(tokenRoute, async (c) => {
     },
     200,
   )
+})
+
+// ---------------------------------------------------------------------------
+// POST /sync/user — on-demand pull of a single FitKoh user's Poster orders.
+//
+// Called by the FitKoh backend when a user taps "Sync with Poster" on their
+// profile (BAC-1065 step 3). Complements the cron auto-importer — both paths
+// produce the same `source_id` format so FitKoh's addItemLog dedup makes
+// repeated calls idempotent.
+// ---------------------------------------------------------------------------
+
+const SyncUserRequestSchema = z
+  .object({
+    fitkohUserId: z
+      .number()
+      .int()
+      .positive()
+      .openapi({ example: 1680001, description: 'FitKoh user id to log meals for.' }),
+    posterClientId: z
+      .number()
+      .int()
+      .positive()
+      .openapi({ example: 2755, description: 'Poster POS client id linked to the FitKoh user.' }),
+    dateFrom: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, 'Use YYYY-MM-DD')
+      .optional()
+      .openapi({ example: '2026-04-01', description: 'Inclusive start date. Defaults to today − 30 days.' }),
+    dateTo: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, 'Use YYYY-MM-DD')
+      .optional()
+      .openapi({ example: '2026-04-15', description: 'Inclusive end date. Defaults to today.' }),
+  })
+  .openapi('SyncUserRequest')
+
+const SyncUserResponseSchema = z
+  .object({
+    imported: z.number().openapi({ example: 3, description: 'Successful dispatches to FitKoh (idempotent — repeats deduped server-side).' }),
+    skipped: z.number().openapi({ example: 1, description: 'Lines skipped because the Poster product had no FitKoh menu mapping.' }),
+    errors: z.number().openapi({ example: 0, description: 'Dispatch or upstream failures encountered during the run.' }),
+    scanned: z.number().openapi({ example: 2, description: 'Number of Poster bills (closed + open) inspected for this client.' }),
+    unmappedProductIds: z
+      .array(z.string())
+      .openapi({
+        example: ['314'],
+        description: 'Distinct Poster product ids encountered with no FitKoh mapping.',
+      }),
+  })
+  .openapi('SyncUserResponse')
+
+const syncUserRoute = createRoute({
+  method: 'post',
+  path: '/sync/user',
+  tags: ['Sync'],
+  summary: "Sync a single FitKoh user's Poster orders on demand.",
+  description: [
+    "Scans Poster for closed and open bills matching `posterClientId` in the",
+    "requested date window and dispatches each mapped line to FitKoh via",
+    "`collaborate.logItemForClient`. Produces the same `source_id` format as",
+    "the cron importer, so repeated calls are idempotent server-side.",
+    '',
+    'If `dateFrom` / `dateTo` are omitted, defaults to the last 30 days.',
+  ].join('\n'),
+  security: [{ ApiKeyAuth: [] }],
+  request: {
+    body: {
+      content: {
+        'application/json': { schema: SyncUserRequestSchema },
+      },
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: SyncUserResponseSchema } },
+      description: 'Sync run completed (see counters for partial results).',
+    },
+    400: {
+      content: { 'application/json': { schema: ErrorResponseSchema } },
+      description: 'Invalid request body',
+    },
+    401: {
+      content: { 'application/json': { schema: ErrorResponseSchema } },
+      description: 'Missing or invalid API key',
+    },
+    500: {
+      content: { 'application/json': { schema: ErrorResponseSchema } },
+      description: 'Upstream (Poster / FitKoh) or bridge error',
+    },
+  },
+})
+
+app.openapi(syncUserRoute, async (c) => {
+  const input = c.req.valid('json')
+  try {
+    const result = await syncUserFromPoster(c.env, input)
+    return c.json(result, 200)
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message : 'Sync failed' },
+      500,
+    )
+  }
 })
 
 export default app
