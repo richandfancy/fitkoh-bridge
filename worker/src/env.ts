@@ -23,4 +23,6 @@ export interface Env {
   // before comparing. Required in production — if unset, request-link will
   // refuse all requests.
   BRIDGE_ADMIN_EMAILS?: string
+  // Optional Sentry DSN for Worker error reporting.
+  SENTRY_DSN?: string
 }

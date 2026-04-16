@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { Scalar } from '@scalar/hono-api-reference'
+import { captureException, withSentry } from '@sentry/cloudflare'
 import type { Env } from './env'
 import { dashboardAuth } from './middleware/auth'
 import { docsAuth } from './middleware/docs-auth'
@@ -13,6 +14,7 @@ import stream from './routes/stream'
 import mcp from './routes/mcp'
 import { warmMealsCache, warmOrdersSnapshot } from './services/cache-warmer'
 import { autoImportNewMeals } from './services/auto-importer'
+import { getCronHealth, recordCronSuccess } from './services/cron-health'
 
 const app = new Hono<{ Bindings: Env }>()
 
@@ -42,9 +44,17 @@ app.use('/api/v1/*', createCorsMiddleware())
 app.use('/mcp', createCorsMiddleware())
 app.use('/mcp/*', createCorsMiddleware())
 
-// Health check
-app.get('/api/health', (c) => {
-  return c.json({ ok: true, environment: c.env.ENVIRONMENT })
+// Health check. Reports stale cron heartbeat when no successful tick happened
+// in the last 180 seconds (BAC-1093).
+app.get('/api/health', async (c) => {
+  const cronHealth = await getCronHealth(c.env)
+  return c.json({
+    ok: !cronHealth.staleCron,
+    environment: c.env.ENVIRONMENT,
+    stale_cron: cronHealth.staleCron,
+    last_cron_ok_at: cronHealth.lastCronOkAt,
+    cron_age_seconds: cronHealth.cronAgeSeconds,
+  })
 })
 
 // Docs and schema are gated behind HTTP Basic auth so the API surface
@@ -98,25 +108,52 @@ app.route('/api/admin', admin)
 // Export as a handler object so Cloudflare invokes the `scheduled` function
 // on every Cron Trigger tick. The `fetch` handler keeps the Hono app routing
 // exactly as before — any issue in the cron path must not break HTTP traffic.
-export default {
+const handler = {
   fetch: app.fetch,
   async scheduled(
-    _event: ScheduledEvent,
+    _controller: ScheduledController,
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
     ctx.waitUntil(
       (async () => {
+        let hasError = false
+
         await warmMealsCache(env).catch((err) => {
+          hasError = true
           console.error('Cache warm failed:', err)
+          captureException(err instanceof Error ? err : new Error(String(err)), {
+            tags: { subsystem: 'cron', step: 'warmMealsCache' },
+          })
         })
         await warmOrdersSnapshot(env).catch((err) => {
+          hasError = true
           console.error('Orders snapshot warm failed:', err)
+          captureException(err instanceof Error ? err : new Error(String(err)), {
+            tags: { subsystem: 'cron', step: 'warmOrdersSnapshot' },
+          })
         })
         await autoImportNewMeals(env).catch((err) => {
+          hasError = true
           console.error('Auto-import failed:', err)
+          captureException(err instanceof Error ? err : new Error(String(err)), {
+            tags: { subsystem: 'cron', step: 'autoImportNewMeals' },
+          })
         })
+
+        if (!hasError) {
+          await recordCronSuccess(env).catch((err) => {
+            console.error('Cron heartbeat write failed:', err)
+          })
+        }
       })(),
     )
   },
 }
+
+export default withSentry(
+  (env: Env) => env.SENTRY_DSN
+    ? { dsn: env.SENTRY_DSN, environment: env.ENVIRONMENT, tracesSampleRate: 0 }
+    : undefined,
+  handler,
+)
