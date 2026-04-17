@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { UserRound } from 'lucide-react'
 import { api } from '@/lib/api'
+import { cn } from '@/lib/utils'
 import { EmptyState } from '@/components/EmptyState'
 import { Skeleton } from '@/components/Skeleton'
 import type { UserMatchRow } from '@shared/types'
@@ -168,7 +169,87 @@ export function UsersPage() {
         Matching dashboard for user identities across source systems.
       </p>
 
-      <div className="bg-card border border-border rounded-xl overflow-x-auto">
+      {/* Mobile: vertical card list so the page never horizontal-scrolls. */}
+      <div className="md:hidden space-y-2">
+        {rows.map((row) => {
+          const displayName =
+            `${row.clockFirstName ?? row.posterFirstName ?? ''} ${row.clockLastName ?? row.posterLastName ?? ''}`.trim()
+            || (row.posterId !== null ? `Poster #${row.posterId}` : 'Unknown guest')
+          const hasOpen = row.posterOpenBillsTotal > 0
+          return (
+            <div
+              key={row.id}
+              className="bg-card border border-border rounded-xl p-3 space-y-2"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm font-semibold text-foreground truncate">
+                    {displayName}
+                  </div>
+                  <div className="text-xs text-muted-foreground truncate">
+                    {row.posterId !== null ? `Poster #${row.posterId}` : 'No Poster ID'}
+                    {row.posterCreatedAt && ` · ${formatPosterDate(row.posterCreatedAt)}`}
+                  </div>
+                </div>
+                <div className="text-xs tabular-nums shrink-0">
+                  {row.lastOrderAt ? (
+                    <span className="text-primary font-medium">
+                      {formatRelative(row.lastOrderAt, now)}
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground">—</span>
+                  )}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="rounded-lg bg-secondary/40 px-2.5 py-1.5">
+                  <div className="text-muted-foreground">Open</div>
+                  <div
+                    className={cn(
+                      'font-semibold tabular-nums',
+                      hasOpen ? 'text-primary' : 'text-muted-foreground',
+                    )}
+                  >
+                    {formatAmount(row.posterOpenBillsTotal)}
+                  </div>
+                </div>
+                <div className="rounded-lg bg-secondary/40 px-2.5 py-1.5">
+                  <div className="text-muted-foreground">Closed</div>
+                  <div className="font-semibold tabular-nums text-foreground">
+                    {formatAmount(row.posterClosedBillsTotal)}
+                  </div>
+                </div>
+              </div>
+
+              {(row.fitkohUserId !== null || row.rezervUserId !== null) && (
+                <div className="flex flex-wrap gap-1.5 text-[10px]">
+                  {row.fitkohUserId !== null && (
+                    <span className="rounded-md bg-secondary/60 px-1.5 py-0.5 text-muted-foreground">
+                      FitKoh #{row.fitkohUserId}
+                    </span>
+                  )}
+                  {row.rezervUserId !== null && (
+                    <span className="rounded-md bg-secondary/60 px-1.5 py-0.5 text-muted-foreground">
+                      Rezerv {row.rezervUserId}
+                    </span>
+                  )}
+                </div>
+              )}
+
+              <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+                <span className="inline-flex items-center gap-1"><SourceDot active={row.hasClock} />Clock</span>
+                <span className="inline-flex items-center gap-1"><SourceDot active={row.hasPoster} />Poster</span>
+                <span className="inline-flex items-center gap-1"><SourceDot active={row.hasFitkoh} />FitKoh</span>
+                <span className="inline-flex items-center gap-1"><SourceDot active={row.hasRezerv} />Rezerv</span>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+
+      {/* Desktop: original wide table. */}
+      <div className="hidden md:block bg-card border border-border rounded-xl overflow-x-auto">
         <table className="w-full min-w-[1060px] text-sm">
           <thead>
             <tr className="border-b border-border text-muted-foreground text-xs">
