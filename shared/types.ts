@@ -119,6 +119,28 @@ export interface PosterClientGroup {
   name: string
 }
 
+// Cross-system user matching row (Clock / Poster / FitKoh / Rezerv).
+export interface UserMatchRow {
+  id: string
+  clockId: string | null
+  clockFirstName: string | null
+  clockLastName: string | null
+  posterId: number | null
+  posterCreatedAt: string | null
+  posterOpenBillsCount: number
+  posterOpenBillsTotal: number
+  posterClosedBillsCount: number
+  posterClosedBillsTotal: number
+  posterFirstName: string | null
+  posterLastName: string | null
+  fitkohUserId: number | null
+  rezervUserId: string | null
+  hasClock: boolean
+  hasPoster: boolean
+  hasFitkoh: boolean
+  hasRezerv: boolean
+}
+
 export interface PosterTransaction {
   transaction_id: string
   date_start: string

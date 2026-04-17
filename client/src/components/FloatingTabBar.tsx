@@ -10,8 +10,11 @@ type NavItem = {
 
 const NAV_ITEMS: NavItem[] = [
   { path: '/orders', icon: ShoppingBag, label: 'Orders' },
-  { path: '/guests', icon: UserRound, label: 'Guests' },
+  { path: '/', icon: UserRound, label: 'Guests' },
 ]
+
+// Routes that render UsersPage — Guests tab highlights on any of them.
+const GUESTS_PATHS = new Set(['/', '/guests', '/users'])
 
 interface FloatingTabBarProps {
   onAddUser: () => void
@@ -21,7 +24,10 @@ interface FloatingTabBarProps {
 export function FloatingTabBar({ onAddUser, addDisabled }: FloatingTabBarProps) {
   const [location, setLocation] = useLocation()
 
-  const isActive = (path: string) => location === path || location.startsWith(`${path}/`)
+  const isActive = (path: string) => {
+    if (path === '/') return GUESTS_PATHS.has(location)
+    return location === path || location.startsWith(`${path}/`)
+  }
 
   return (
     <nav

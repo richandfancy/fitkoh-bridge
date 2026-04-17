@@ -147,6 +147,21 @@ export class PosterClient {
     return result
   }
 
+  // Open (in-progress) transactions for a date range. Returns bills where
+  // the check hasn't been closed yet — used for the per-user open-bill totals
+  // on the Guests/UsersPage dashboard.
+  async getOpenTransactions(
+    dateFrom: string,
+    dateTo: string,
+  ): Promise<PosterTransaction[]> {
+    const result = await this.request<PosterTransaction[]>('dash.getTransactions', {
+      dateFrom,
+      dateTo,
+      status: '1',
+    })
+    return Array.isArray(result) ? result : []
+  }
+
   // Per-line products for a single transaction. The `time` field is the
   // unix-ms punch-in timestamp for each line (when the waiter tapped it in),
   // which is what FitKoh needs for macro bucketing — not the bill close time.

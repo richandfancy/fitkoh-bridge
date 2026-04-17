@@ -14,6 +14,7 @@ import { GuestDetailPage } from '@/pages/GuestDetail'
 import { DeadLettersPage } from '@/pages/DeadLetters'
 import { SettingsPage } from '@/pages/Settings'
 import { PreInvoicePage } from '@/pages/PreInvoice'
+import { UsersPage } from '@/pages/Users'
 
 function AppContent() {
   const { isAuthenticated, isLoading } = useAuth()
@@ -33,11 +34,14 @@ function AppContent() {
   return (
     <Layout>
       <Switch>
-        <Route path="/" component={ActivityPage} />
+        <Route path="/" component={UsersPage} />
+        <Route path="/users" component={UsersPage} />
+        <Route path="/guests" component={UsersPage} />
         <Route path="/orders" component={OrdersPage} />
-        <Route path="/guests" component={GuestsPage} />
         <Route path="/guests/:id" component={GuestDetailPage} />
         <Route path="/pre-invoice/:posterClientId?" component={PreInvoicePage} />
+        <Route path="/activity" component={ActivityPage} />
+        <Route path="/legacy-guests" component={GuestsPage} />
         <Route path="/dead-letters" component={DeadLettersPage} />
         <Route path="/settings" component={SettingsPage} />
         <Route>

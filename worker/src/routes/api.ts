@@ -17,6 +17,7 @@ import type {
   PreInvoiceDay,
   PreInvoiceItem,
   PosterClientGroup,
+  UserMatchRow,
 } from '@shared/types'
 
 // Helper for batched parallel calls (P4 fix — avoids N+1 sequential API calls)
@@ -35,6 +36,60 @@ async function processInBatches<T, R>(
 }
 
 const app = new Hono<{ Bindings: Env }>()
+
+function splitGuestName(guestName: string | null): {
+  firstName: string | null
+  lastName: string | null
+} {
+  if (!guestName) return { firstName: null, lastName: null }
+  const parts = guestName.trim().split(/\s+/).filter(Boolean)
+  if (parts.length === 0) return { firstName: null, lastName: null }
+  if (parts.length === 1) return { firstName: parts[0], lastName: null }
+  return {
+    firstName: parts.slice(0, -1).join(' '),
+    lastName: parts[parts.length - 1],
+  }
+}
+
+function parseUserMapping(raw: string | null): Record<
+  string,
+  { fitkohUserId: number | null; rezervUserId: string | null }
+> {
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    const result: Record<
+      string,
+      { fitkohUserId: number | null; rezervUserId: string | null }
+    > = {}
+
+    for (const [posterId, value] of Object.entries(parsed)) {
+      if (typeof value === 'number') {
+        result[posterId] = { fitkohUserId: value, rezervUserId: null }
+        continue
+      }
+
+      if (typeof value === 'object' && value !== null) {
+        const maybeObj = value as {
+          fitkohUserId?: unknown
+          rezervUserId?: unknown
+        }
+        result[posterId] = {
+          fitkohUserId: typeof maybeObj.fitkohUserId === 'number'
+            ? maybeObj.fitkohUserId
+            : null,
+          rezervUserId: typeof maybeObj.rezervUserId === 'string'
+            ? maybeObj.rezervUserId
+            : null,
+        }
+      }
+    }
+
+    return result
+  } catch {
+    return {}
+  }
+}
 
 // Dashboard stats
 app.get('/stats', async (c) => {
@@ -272,6 +327,215 @@ app.post('/poster/clients', async (c) => {
   })
 
   return c.json({ posterClientId })
+})
+
+// Cross-system user matching list — populates the Guests tab dashboard with
+// Poster clients, Clock booking names, mapped FitKoh/Rezerv user IDs, and
+// open-bill totals per user.
+app.get('/users', async (c) => {
+  const bookingsResult = await c.env.DB.prepare(
+    `SELECT clock_booking_id, guest_name, poster_client_id, created_at
+     FROM bookings
+     ORDER BY created_at DESC`,
+  ).all<{
+    clock_booking_id: string
+    guest_name: string | null
+    poster_client_id: number | null
+    created_at: string
+  }>()
+
+  const bookings = bookingsResult.results
+
+  const mappingRaw = await c.env.CONFIG.get('poster_to_fitkoh_users')
+  const userMapping = parseUserMapping(mappingRaw)
+
+  const posterClientById = new Map<
+    number,
+    {
+      firstName: string | null
+      lastName: string | null
+      createdAt: string | null
+      closedBillsTotal: number
+    }
+  >()
+  const poster = new PosterClient(c.env.POSTER_ACCESS_TOKEN)
+  try {
+    const posterClients = await poster.getClients({ num: 10000 })
+    for (const client of posterClients) {
+      const posterId = Number(client.client_id)
+      if (!Number.isFinite(posterId)) continue
+      posterClientById.set(posterId, {
+        firstName: client.firstname || null,
+        lastName: client.lastname || null,
+        createdAt: (client as { date_activale?: string }).date_activale || null,
+        closedBillsTotal: Number(client.total_payed_sum || 0) / 100,
+      })
+    }
+  } catch {
+    // Fall through — keep whatever we have.
+  }
+
+  const unpaidBillsByPosterId = new Map<number, { count: number; total: number }>()
+  try {
+    const todayCompact = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+    const unpaidBills = await poster.getOpenTransactions('20000101', todayCompact)
+    for (const bill of unpaidBills) {
+      const posterId = Number(bill.client_id)
+      if (!Number.isFinite(posterId) || posterId <= 0) continue
+      const sumSatang = Number(bill.sum)
+      const amount = Number.isFinite(sumSatang) ? sumSatang / 100 : 0
+      const prior = unpaidBillsByPosterId.get(posterId) ?? { count: 0, total: 0 }
+      unpaidBillsByPosterId.set(posterId, {
+        count: prior.count + 1,
+        total: prior.total + amount,
+      })
+    }
+  } catch {
+    // Keep users table available even if current open bill fetch fails.
+  }
+
+  const rowsById = new Map<string, UserMatchRow>()
+
+  for (const [posterId, posterName] of posterClientById.entries()) {
+    const mapping = userMapping[String(posterId)]
+    rowsById.set(`poster:${posterId}`, {
+      id: `poster:${posterId}`,
+      clockId: null,
+      clockFirstName: null,
+      clockLastName: null,
+      posterId,
+      posterCreatedAt: posterName.createdAt,
+      posterOpenBillsCount: unpaidBillsByPosterId.get(posterId)?.count ?? 0,
+      posterOpenBillsTotal: unpaidBillsByPosterId.get(posterId)?.total ?? 0,
+      posterClosedBillsCount: 0,
+      posterClosedBillsTotal: posterName.closedBillsTotal,
+      posterFirstName: posterName.firstName,
+      posterLastName: posterName.lastName,
+      fitkohUserId: mapping?.fitkohUserId ?? null,
+      rezervUserId: mapping?.rezervUserId ?? null,
+      hasClock: false,
+      hasPoster: true,
+      hasFitkoh: (mapping?.fitkohUserId ?? null) !== null,
+      hasRezerv: (mapping?.rezervUserId ?? null) !== null,
+    })
+  }
+
+  for (const booking of bookings) {
+    const clockName = splitGuestName(booking.guest_name)
+    const posterId = booking.poster_client_id
+    const mapping = posterId !== null ? userMapping[String(posterId)] : undefined
+    const posterName = posterId !== null
+      ? (posterClientById.get(posterId) ?? {
+          firstName: null,
+          lastName: null,
+          createdAt: null,
+          closedBillsTotal: 0,
+        })
+      : { firstName: null, lastName: null, createdAt: null, closedBillsTotal: 0 }
+
+    const rowId = posterId !== null
+      ? `poster:${posterId}`
+      : `clock:${booking.clock_booking_id}`
+
+    const existing = rowsById.get(rowId)
+    if (existing) {
+      if (!existing.clockId) existing.clockId = booking.clock_booking_id
+      if (!existing.clockFirstName) existing.clockFirstName = clockName.firstName
+      if (!existing.clockLastName) existing.clockLastName = clockName.lastName
+      existing.hasClock = true
+      if (!existing.posterFirstName) existing.posterFirstName = posterName.firstName
+      if (!existing.posterLastName) existing.posterLastName = posterName.lastName
+      if (!existing.posterCreatedAt) existing.posterCreatedAt = posterName.createdAt
+      if (existing.posterOpenBillsTotal === 0) {
+        existing.posterOpenBillsTotal = unpaidBillsByPosterId.get(posterId ?? -1)?.total ?? 0
+      }
+      if (existing.posterOpenBillsCount === 0) {
+        existing.posterOpenBillsCount = unpaidBillsByPosterId.get(posterId ?? -1)?.count ?? 0
+      }
+      if (existing.posterClosedBillsTotal === 0) {
+        existing.posterClosedBillsTotal = posterName.closedBillsTotal
+      }
+      continue
+    }
+
+    rowsById.set(rowId, {
+      id: rowId,
+      clockId: booking.clock_booking_id,
+      clockFirstName: clockName.firstName,
+      clockLastName: clockName.lastName,
+      posterId,
+      posterCreatedAt: posterName.createdAt,
+      posterOpenBillsCount: posterId !== null ? (unpaidBillsByPosterId.get(posterId)?.count ?? 0) : 0,
+      posterOpenBillsTotal: posterId !== null ? (unpaidBillsByPosterId.get(posterId)?.total ?? 0) : 0,
+      posterClosedBillsCount: 0,
+      posterClosedBillsTotal: posterName.closedBillsTotal,
+      posterFirstName: posterName.firstName,
+      posterLastName: posterName.lastName,
+      fitkohUserId: mapping?.fitkohUserId ?? null,
+      rezervUserId: mapping?.rezervUserId ?? null,
+      hasClock: true,
+      hasPoster: posterId !== null,
+      hasFitkoh: (mapping?.fitkohUserId ?? null) !== null,
+      hasRezerv: (mapping?.rezervUserId ?? null) !== null,
+    })
+  }
+
+  for (const [posterIdStr, mapping] of Object.entries(userMapping)) {
+    const posterId = Number(posterIdStr)
+    if (!Number.isFinite(posterId)) continue
+    const rowId = `poster:${posterId}`
+    if (rowsById.has(rowId)) continue
+
+    const posterName = posterClientById.get(posterId) ?? {
+      firstName: null,
+      lastName: null,
+      createdAt: null,
+      closedBillsTotal: 0,
+    }
+
+    rowsById.set(rowId, {
+      id: rowId,
+      clockId: null,
+      clockFirstName: null,
+      clockLastName: null,
+      posterId,
+      posterCreatedAt: posterName.createdAt,
+      posterOpenBillsCount: unpaidBillsByPosterId.get(posterId)?.count ?? 0,
+      posterOpenBillsTotal: unpaidBillsByPosterId.get(posterId)?.total ?? 0,
+      posterClosedBillsCount: 0,
+      posterClosedBillsTotal: posterName.closedBillsTotal,
+      posterFirstName: posterName.firstName,
+      posterLastName: posterName.lastName,
+      fitkohUserId: mapping.fitkohUserId,
+      rezervUserId: mapping.rezervUserId,
+      hasClock: false,
+      hasPoster: true,
+      hasFitkoh: mapping.fitkohUserId !== null,
+      hasRezerv: mapping.rezervUserId !== null,
+    })
+  }
+
+  const rows = Array.from(rowsById.values())
+  rows.sort((a, b) => {
+    const aTs = a.posterCreatedAt
+      ? new Date(a.posterCreatedAt.replace(' ', 'T')).getTime()
+      : Number.NaN
+    const bTs = b.posterCreatedAt
+      ? new Date(b.posterCreatedAt.replace(' ', 'T')).getTime()
+      : Number.NaN
+
+    const aValid = Number.isFinite(aTs)
+    const bValid = Number.isFinite(bTs)
+    if (aValid && bValid) return bTs - aTs
+    if (aValid) return -1
+    if (bValid) return 1
+
+    const aName = `${a.clockLastName || a.posterLastName || ''} ${a.clockFirstName || a.posterFirstName || ''}`.trim()
+    const bName = `${b.clockLastName || b.posterLastName || ''} ${b.clockFirstName || b.posterFirstName || ''}`.trim()
+    return aName.localeCompare(bName)
+  })
+
+  return c.json(rows)
 })
 
 // Activity log (paginated, filterable)
