@@ -37,10 +37,19 @@ pnpm db:migrate:remote # Apply D1 migrations to production
 ```
 
 ## Deployment (NEVER skip staging)
-1. Push to `staging` branch → auto-deploys to `s.bridge.fitkoh.app`
-2. Smoke test on staging for 5 minutes minimum
-3. Merge `staging` → `main` → auto-deploys to `bridge.fitkoh.app`
-4. Verify health: `curl https://bridge.fitkoh.app/api/health`
+**Deploys are manual** — Cloudflare Workers Git integration is NOT wired. Pushing to `staging` or `main` updates the git branch but does not deploy. You must run `wrangler deploy` yourself.
+
+1. Commit your changes first (the `swVersionPlugin` bakes `git rev-parse HEAD` at build time — build before commit → stale SW cache version).
+2. Push to `staging` so the branch reflects what's about to deploy.
+3. `pnpm build` (rewrites `dist/sw.js` with `CACHE_VERSION = 'bridge-{sha8}'`).
+4. `cd worker && npx wrangler deploy --env staging` → `bridge-staging.fitkoh.app`.
+5. **Verify by asset-hash diff**, not `/api/health`:
+   - `curl -s https://bridge-staging.fitkoh.app/ | grep -oE 'assets/[^"]+\.js'` → hash should change between deploys.
+   - `curl -s https://bridge-staging.fitkoh.app/sw.js | grep CACHE_VERSION` → must match your committed HEAD.
+6. Smoke test on staging for 5 minutes minimum.
+7. Merge `staging` → `main` and repeat: `pnpm build && cd worker && npx wrangler deploy` (no `--env` flag deploys to production `bridge.fitkoh.app`).
+
+`curl https://bridge.fitkoh.app/api/health` is a *worker uptime* check — it returns 200 even if the deploy silently failed or you deployed stale assets. Trust the asset hash.
 
 ## Architecture Decisions
 
