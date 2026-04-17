@@ -63,8 +63,18 @@ export class PosterClient {
   async createClient(data: {
     client_name: string
     client_groups_id_client: number
+    firstname?: string
+    lastname?: string
+    patronymic?: string
     phone?: string
+    phone_number?: string
     email?: string
+    birthday?: string
+    card_number?: string
+    client_sex?: number
+    country?: string
+    city?: string
+    address?: string
     comment?: string
   }): Promise<number> {
     const url = new URL(`${this.baseUrl}clients.createClient`)

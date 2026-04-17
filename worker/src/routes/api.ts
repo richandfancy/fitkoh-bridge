@@ -16,6 +16,7 @@ import type {
   PreInvoiceResponse,
   PreInvoiceDay,
   PreInvoiceItem,
+  PosterClientGroup,
 } from '@shared/types'
 
 // Helper for batched parallel calls (P4 fix — avoids N+1 sequential API calls)
@@ -190,6 +191,87 @@ app.get('/orders', async (c) => {
     closedOrders: dashTxns.filter((t) => t.status === '2').length,
     items,
   })
+})
+
+// Poster client groups — derived from the client list. Used by CreateUserDrawer.
+app.get('/poster/client-groups', async (c) => {
+  const poster = new PosterClient(c.env.POSTER_ACCESS_TOKEN)
+  const clients = await poster.getClients({ num: 10000 })
+
+  const groupsById = new Map<number, string>()
+  for (const c0 of clients) {
+    const id = Number((c0 as unknown as { client_groups_id: string }).client_groups_id)
+    const name = String((c0 as unknown as { client_groups_name: string }).client_groups_name || '').trim()
+    if (!Number.isFinite(id) || id <= 0) continue
+    if (!name) continue
+    groupsById.set(id, name)
+  }
+
+  const groups: PosterClientGroup[] = Array.from(groupsById.entries())
+    .map(([id, name]) => ({ id, name }))
+    .sort((a, b) => a.name.localeCompare(b.name))
+
+  return c.json(groups)
+})
+
+// Create a Poster client from the CreateUserDrawer form.
+app.post('/poster/clients', async (c) => {
+  let body: {
+    groupId?: number
+    firstName?: string
+    lastName?: string
+    patronymic?: string
+    phone?: string
+    email?: string
+    birthday?: string
+    gender?: number
+    cardNumber?: string
+    comment?: string
+    country?: string
+    city?: string
+    address?: string
+  } = {}
+  try {
+    body = await c.req.json()
+  } catch {
+    body = {}
+  }
+
+  const groupId = Number(body.groupId)
+  if (!Number.isFinite(groupId) || groupId <= 0) {
+    return c.json({ error: 'Group is required' }, 400)
+  }
+
+  const firstName = (body.firstName ?? '').trim()
+  const lastName = (body.lastName ?? '').trim()
+  const phone = (body.phone ?? '').trim()
+  const email = (body.email ?? '').trim()
+
+  if (!firstName && !lastName && !phone && !email) {
+    return c.json({ error: 'Provide at least a name, phone, or email' }, 400)
+  }
+
+  const displayName = `${firstName} ${lastName}`.trim() || phone || email
+
+  const poster = new PosterClient(c.env.POSTER_ACCESS_TOKEN)
+  const posterClientId = await poster.createClient({
+    client_name: displayName,
+    client_groups_id_client: groupId,
+    firstname: firstName || undefined,
+    lastname: lastName || undefined,
+    patronymic: (body.patronymic ?? '').trim() || undefined,
+    phone: phone || undefined,
+    email: email || undefined,
+    birthday: (body.birthday ?? '').trim() || undefined,
+    client_sex: Number.isFinite(Number(body.gender)) ? Number(body.gender) : undefined,
+    card_number: (body.cardNumber ?? '').trim() || undefined,
+    comment: (body.comment ?? '').trim() || undefined,
+    country: (body.country ?? '').trim() || undefined,
+    city: (body.city ?? '').trim() || undefined,
+    address: (body.address ?? '').trim() || undefined,
+  })
+
+  return c.json({ posterClientId })
 })
 
 // Activity log (paginated, filterable)

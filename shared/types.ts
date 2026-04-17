@@ -114,6 +114,11 @@ export interface PosterClient {
   total_payed_sum: string
 }
 
+export interface PosterClientGroup {
+  id: number
+  name: string
+}
+
 export interface PosterTransaction {
   transaction_id: string
   date_start: string
