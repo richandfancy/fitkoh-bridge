@@ -121,10 +121,22 @@ export async function warmOrdersSnapshot(env: Env): Promise<void> {
 
   const clientNames = new Map<string, string>()
   const spotNames = new Map<string, string>()
-  // Tracks the most recent order (date_start) per client for the Guests tab
-  // sort order (BAC-1149). Latest wins across open + closed transactions.
+  // Most recent order timestamp per client, normalized to ISO 8601 for the
+  // Guests tab sort (BAC-1149). Poster's `dash.getTransactions` returns
+  // date_start / date_close as unix-ms strings (e.g. "1776400559048"), not
+  // the "YYYY-MM-DD HH:MM:SS" format other Poster endpoints use — normalize
+  // here so consumers don't have to guess the format.
   const lastOrderByClient: Record<string, string> = {}
   const dashArr = Array.isArray(dashTxns) ? dashTxns : []
+
+  function toIso(raw: string | undefined): string | null {
+    if (!raw || raw === '0') return null
+    const ms = Number(raw)
+    if (Number.isFinite(ms) && ms > 0) return new Date(ms).toISOString()
+    if (raw.includes('-')) return raw.replace(' ', 'T')
+    return null
+  }
+
   for (const t of dashArr) {
     if (
       t.client_id &&
@@ -139,10 +151,20 @@ export async function warmOrdersSnapshot(env: Env): Promise<void> {
     if (t.spot_id && t.name) {
       spotNames.set(String(t.spot_id), t.name.trim())
     }
-    if (t.client_id && t.client_id !== '0' && t.date_start) {
-      const prior = lastOrderByClient[t.client_id]
-      if (!prior || t.date_start > prior) {
-        lastOrderByClient[t.client_id] = t.date_start
+    if (t.client_id && t.client_id !== '0') {
+      // Latest of start/close so closed bills reflect checkout time and
+      // open bills fall back to open time.
+      const startIso = toIso(t.date_start)
+      const closeIso = toIso(t.date_close)
+      const candidate =
+        startIso && closeIso
+          ? (startIso > closeIso ? startIso : closeIso)
+          : (startIso ?? closeIso)
+      if (candidate) {
+        const prior = lastOrderByClient[t.client_id]
+        if (!prior || candidate > prior) {
+          lastOrderByClient[t.client_id] = candidate
+        }
       }
     }
   }
