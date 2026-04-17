@@ -133,10 +133,10 @@ export interface UserMatchRow {
   posterClosedBillsTotal: number
   posterFirstName: string | null
   posterLastName: string | null
-  // Most recent order line for this user, derived from live_orders_snapshot
-  // KV (warmed every 60s by cron). ISO 8601 string; null when no recent
-  // order is tracked for this client.
-  lastOrderAt: string | null
+  // Most recent punch event (item added, open, close, sign) for this user.
+  // Derived from Poster's dash.getTransactionHistory log via the cron-warmed
+  // live_orders_snapshot KV. ISO 8601; null when no activity is tracked.
+  lastPunchAt: string | null
   fitkohUserId: number | null
   rezervUserId: string | null
   hasClock: boolean

@@ -158,20 +158,67 @@ export async function warmOrdersSnapshot(env: Env): Promise<void> {
     }
   }
 
-  // Last punch per client — taken from the transaction's `date_close` on the
-  // detailed feed. Poster updates that field on every item-punch and on
-  // close/sign events, which is exactly what the Guests tab sort should
-  // reflect (BAC-1149). Clients whose transaction_id isn't in dashArr's
-  // client_id map simply don't contribute.
-  const lastOrderByClient: Record<string, string> = {}
+  // Last punch per client (BAC-1149).
+  //
+  // For CLOSED transactions, `date_close` from the detailed feed is the real
+  // close timestamp — static and correct.
+  //
+  // For OPEN transactions we need true per-item punch time. Poster's
+  // `transactions.getTransactions.date_close` happens to move on punch events
+  // but the name is misleading and the contract isn't documented. The
+  // authoritative source is `dash.getTransactionHistory(txnId)` which returns
+  // a per-event log (`additem`, `open`, `close`, `sign`, …) with unix-ms
+  // timestamps. We take max(event.time) across all entries so any activity
+  // counts as a punch.
+  //
+  // Cost: +1 Poster call per open transaction per cron tick (~30/min at
+  // peak). Well under the API budget.
+  const lastPunchByClient: Record<string, string> = {}
+
   for (const t of detailed) {
     const clientIdStr = clientIdByTxn.get(t.transaction_id)
     if (!clientIdStr) continue
     const iso = toIso(t.date_close)
     if (!iso) continue
-    const prior = lastOrderByClient[clientIdStr]
+    const prior = lastPunchByClient[clientIdStr]
     if (!prior || iso > prior) {
-      lastOrderByClient[clientIdStr] = iso
+      lastPunchByClient[clientIdStr] = iso
+    }
+  }
+
+  const openTxnsWithClients: Array<{ transactionId: number; clientId: string }> = []
+  for (const t of dashArr) {
+    if (t.status !== '1') continue
+    if (!t.client_id || t.client_id === '0') continue
+    if (!t.transaction_id) continue
+    openTxnsWithClients.push({
+      transactionId: Number(t.transaction_id),
+      clientId: t.client_id,
+    })
+  }
+
+  const HISTORY_CONCURRENCY = 5
+  const historyResults = await processInBatches(
+    openTxnsWithClients,
+    HISTORY_CONCURRENCY,
+    async ({ transactionId, clientId }) => {
+      const history = await poster.getTransactionHistory(String(transactionId))
+      let maxMs = 0
+      for (const ev of history || []) {
+        const ms = Number(ev.time)
+        if (Number.isFinite(ms) && ms > maxMs) maxMs = ms
+      }
+      return { clientId, maxMs }
+    },
+  )
+  for (const r of historyResults) {
+    if (!r.ok) continue
+    const { clientId, maxMs } = r.value
+    if (!maxMs) continue
+    const iso = new Date(maxMs).toISOString()
+    const prior = lastPunchByClient[clientId]
+    if (!prior || iso > prior) {
+      lastPunchByClient[clientId] = iso
     }
   }
 
@@ -223,7 +270,10 @@ export async function warmOrdersSnapshot(env: Env): Promise<void> {
       updatedAt: new Date().toISOString(),
       openOrders: dashArr.filter((t) => t.status === '1').length,
       closedOrders: dashArr.filter((t) => t.status === '2').length,
-      lastOrderByClient,
+      lastPunchByClient,
+      // Keep the old key around for one deploy so the /users endpoint can
+      // roll over without a blank "Last Punch" column during the transition.
+      lastOrderByClient: lastPunchByClient,
     }),
   )
 }

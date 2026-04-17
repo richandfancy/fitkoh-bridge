@@ -349,16 +349,20 @@ app.get('/users', async (c) => {
   const mappingRaw = await c.env.CONFIG.get('poster_to_fitkoh_users')
   const userMapping = parseUserMapping(mappingRaw)
 
-  // Per-client last order time (BAC-1149), derived from the cron-warmed
-  // live_orders_snapshot. Populated by warmOrdersSnapshot() in cache-warmer.ts.
-  const lastOrderByClient = await (async (): Promise<Record<string, string>> => {
+  // Per-client last punch (BAC-1149), derived from the cron-warmed
+  // live_orders_snapshot. Populated by warmOrdersSnapshot() — reads from
+  // dash.getTransactionHistory for open transactions. Reads
+  // `lastPunchByClient` with a fallback to the legacy `lastOrderByClient`
+  // key so older snapshots still sort correctly during rollout.
+  const lastPunchByClient = await (async (): Promise<Record<string, string>> => {
     try {
       const raw = await c.env.CONFIG.get('live_orders_snapshot')
       if (!raw) return {}
       const snapshot = JSON.parse(raw) as {
+        lastPunchByClient?: Record<string, string>
         lastOrderByClient?: Record<string, string>
       }
-      return snapshot.lastOrderByClient ?? {}
+      return snapshot.lastPunchByClient ?? snapshot.lastOrderByClient ?? {}
     } catch {
       return {}
     }
@@ -426,7 +430,7 @@ app.get('/users', async (c) => {
       posterClosedBillsTotal: posterName.closedBillsTotal,
       posterFirstName: posterName.firstName,
       posterLastName: posterName.lastName,
-      lastOrderAt: null,
+      lastPunchAt: null,
       fitkohUserId: mapping?.fitkohUserId ?? null,
       rezervUserId: mapping?.rezervUserId ?? null,
       hasClock: false,
@@ -487,7 +491,7 @@ app.get('/users', async (c) => {
       posterClosedBillsTotal: posterName.closedBillsTotal,
       posterFirstName: posterName.firstName,
       posterLastName: posterName.lastName,
-      lastOrderAt: null,
+      lastPunchAt: null,
       fitkohUserId: mapping?.fitkohUserId ?? null,
       rezervUserId: mapping?.rezervUserId ?? null,
       hasClock: true,
@@ -523,7 +527,7 @@ app.get('/users', async (c) => {
       posterClosedBillsTotal: posterName.closedBillsTotal,
       posterFirstName: posterName.firstName,
       posterLastName: posterName.lastName,
-      lastOrderAt: null,
+      lastPunchAt: null,
       fitkohUserId: mapping.fitkohUserId,
       rezervUserId: mapping.rezervUserId,
       hasClock: false,
@@ -533,16 +537,16 @@ app.get('/users', async (c) => {
     })
   }
 
-  // Attach the most recent order timestamp so the Guests tab can put the user
-  // with the freshest order at the top (BAC-1149). Rows without a Poster ID
-  // (Clock-only bookings) or no tracked order get null.
+  // Attach the most recent punch event so the Guests tab can put the
+  // actively-ordering user at the top (BAC-1149). Rows without a Poster ID
+  // or no tracked activity get null.
   for (const row of rowsById.values()) {
-    row.lastOrderAt = row.posterId !== null
-      ? (lastOrderByClient[String(row.posterId)] ?? null)
+    row.lastPunchAt = row.posterId !== null
+      ? (lastPunchByClient[String(row.posterId)] ?? null)
       : null
   }
 
-  function parseOrderTs(raw: string | null): number {
+  function parsePunchTs(raw: string | null): number {
     if (!raw) return Number.NaN
     const ts = new Date(raw.replace(' ', 'T')).getTime()
     return Number.isFinite(ts) ? ts : Number.NaN
@@ -550,18 +554,18 @@ app.get('/users', async (c) => {
 
   const rows = Array.from(rowsById.values())
   rows.sort((a, b) => {
-    // Primary: most recent order first (nulls fall through).
-    const aOrder = parseOrderTs(a.lastOrderAt)
-    const bOrder = parseOrderTs(b.lastOrderAt)
-    const aOrderValid = Number.isFinite(aOrder)
-    const bOrderValid = Number.isFinite(bOrder)
-    if (aOrderValid && bOrderValid && aOrder !== bOrder) return bOrder - aOrder
-    if (aOrderValid && !bOrderValid) return -1
-    if (!aOrderValid && bOrderValid) return 1
+    // Primary: most recent punch first (nulls fall through).
+    const aPunch = parsePunchTs(a.lastPunchAt)
+    const bPunch = parsePunchTs(b.lastPunchAt)
+    const aPunchValid = Number.isFinite(aPunch)
+    const bPunchValid = Number.isFinite(bPunch)
+    if (aPunchValid && bPunchValid && aPunch !== bPunch) return bPunch - aPunch
+    if (aPunchValid && !bPunchValid) return -1
+    if (!aPunchValid && bPunchValid) return 1
 
     // Secondary: Poster account creation, newest first.
-    const aTs = parseOrderTs(a.posterCreatedAt)
-    const bTs = parseOrderTs(b.posterCreatedAt)
+    const aTs = parsePunchTs(a.posterCreatedAt)
+    const bTs = parsePunchTs(b.posterCreatedAt)
     const aValid = Number.isFinite(aTs)
     const bValid = Number.isFinite(bTs)
     if (aValid && bValid) return bTs - aTs

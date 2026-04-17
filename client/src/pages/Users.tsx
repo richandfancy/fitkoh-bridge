@@ -192,9 +192,9 @@ export function UsersPage() {
                   </div>
                 </div>
                 <div className="text-xs tabular-nums shrink-0">
-                  {row.lastOrderAt ? (
+                  {row.lastPunchAt ? (
                     <span className="text-primary font-medium">
-                      {formatRelative(row.lastOrderAt, now)}
+                      {formatRelative(row.lastPunchAt, now)}
                     </span>
                   ) : (
                     <span className="text-muted-foreground">—</span>
@@ -272,8 +272,8 @@ export function UsersPage() {
             {rows.map((row) => (
               <tr key={row.id} className="border-b border-border last:border-0">
                 <td className="px-4 py-3 text-foreground whitespace-nowrap">
-                  {row.lastOrderAt ? (
-                    <span className="text-primary">{formatRelative(row.lastOrderAt, now)}</span>
+                  {row.lastPunchAt ? (
+                    <span className="text-primary">{formatRelative(row.lastPunchAt, now)}</span>
                   ) : (
                     <span className="text-muted-foreground">—</span>
                   )}
