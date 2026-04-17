@@ -1,9 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { UserRound } from 'lucide-react'
 import { api } from '@/lib/api'
 import { EmptyState } from '@/components/EmptyState'
 import { Skeleton } from '@/components/Skeleton'
 import type { UserMatchRow } from '@shared/types'
+
+const POLL_INTERVAL_MS = 15_000
 
 function formatPosterDate(value: string | null): string {
   if (!value) return '—'
@@ -11,6 +13,21 @@ function formatPosterDate(value: string | null): string {
   const date = new Date(parsed)
   if (Number.isNaN(date.getTime())) return value
   return date.toLocaleString()
+}
+
+function formatRelative(value: string | null, now: number): string {
+  if (!value) return '—'
+  const parsed = value.replace(' ', 'T')
+  const ts = new Date(parsed).getTime()
+  if (!Number.isFinite(ts)) return '—'
+  const deltaSec = Math.max(0, Math.round((now - ts) / 1000))
+  if (deltaSec < 60) return `${deltaSec}s ago`
+  const deltaMin = Math.round(deltaSec / 60)
+  if (deltaMin < 60) return `${deltaMin}m ago`
+  const deltaHr = Math.round(deltaMin / 60)
+  if (deltaHr < 24) return `${deltaHr}h ago`
+  const deltaDay = Math.round(deltaHr / 24)
+  return `${deltaDay}d ago`
 }
 
 function formatAmount(total: number | null | undefined): string {
@@ -33,23 +50,68 @@ export function UsersPage() {
   const [rows, setRows] = useState<UserMatchRow[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [now, setNow] = useState(() => Date.now())
+  const isFetchingRef = useRef(false)
 
-  const load = () => {
-    setLoading(true)
-    api.get<UserMatchRow[]>('/api/dashboard/users')
-      .then(setRows)
-      .catch((err) => {
-        setError(err instanceof Error ? err.message : 'Failed to load users')
-      })
-      .finally(() => setLoading(false))
+  const load = async (opts: { showSkeleton?: boolean } = {}) => {
+    if (isFetchingRef.current) return
+    isFetchingRef.current = true
+    if (opts.showSkeleton) setLoading(true)
+    try {
+      const data = await api.get<UserMatchRow[]>('/api/dashboard/users')
+      setRows(data)
+      setError(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load users')
+    } finally {
+      if (opts.showSkeleton) setLoading(false)
+      isFetchingRef.current = false
+    }
   }
 
   useEffect(() => {
-    load()
+    load({ showSkeleton: true })
     const onRefresh = () => load()
     window.addEventListener('bridge:guests:refresh', onRefresh)
     return () => window.removeEventListener('bridge:guests:refresh', onRefresh)
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Poll for fresh data while the page is visible. BAC-1149: puts the user
+  // with the most recent order at the top as orders come in.
+  useEffect(() => {
+    let interval: number | null = null
+    const start = () => {
+      if (interval !== null) return
+      interval = window.setInterval(() => load(), POLL_INTERVAL_MS)
+    }
+    const stop = () => {
+      if (interval !== null) {
+        window.clearInterval(interval)
+        interval = null
+      }
+    }
+    const onVisibility = () => {
+      if (document.hidden) {
+        stop()
+      } else {
+        load()
+        start()
+      }
+    }
+    if (!document.hidden) start()
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      stop()
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Tick once a second to keep relative timestamps fresh without refetching.
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(id)
   }, [])
 
   if (loading) {
@@ -107,9 +169,10 @@ export function UsersPage() {
       </p>
 
       <div className="bg-card border border-border rounded-xl overflow-x-auto">
-        <table className="w-full min-w-[980px] text-sm">
+        <table className="w-full min-w-[1060px] text-sm">
           <thead>
             <tr className="border-b border-border text-muted-foreground text-xs">
+              <th className="text-left px-4 py-3 font-medium">Last Order</th>
               <th className="text-left px-4 py-3 font-medium">Clock ID</th>
               <th className="text-left px-4 py-3 font-medium">Clock Firstname</th>
               <th className="text-left px-4 py-3 font-medium">Clock Lastname</th>
@@ -127,6 +190,13 @@ export function UsersPage() {
           <tbody>
             {rows.map((row) => (
               <tr key={row.id} className="border-b border-border last:border-0">
+                <td className="px-4 py-3 text-foreground whitespace-nowrap">
+                  {row.lastOrderAt ? (
+                    <span className="text-primary">{formatRelative(row.lastOrderAt, now)}</span>
+                  ) : (
+                    <span className="text-muted-foreground">—</span>
+                  )}
+                </td>
                 <td className="px-4 py-3 text-foreground">{row.clockId ?? '—'}</td>
                 <td className="px-4 py-3 text-foreground">{row.clockFirstName ?? '—'}</td>
                 <td className="px-4 py-3 text-foreground">{row.clockLastName ?? '—'}</td>

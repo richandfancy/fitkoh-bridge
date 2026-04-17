@@ -121,6 +121,9 @@ export async function warmOrdersSnapshot(env: Env): Promise<void> {
 
   const clientNames = new Map<string, string>()
   const spotNames = new Map<string, string>()
+  // Tracks the most recent order (date_start) per client for the Guests tab
+  // sort order (BAC-1149). Latest wins across open + closed transactions.
+  const lastOrderByClient: Record<string, string> = {}
   const dashArr = Array.isArray(dashTxns) ? dashTxns : []
   for (const t of dashArr) {
     if (
@@ -135,6 +138,12 @@ export async function warmOrdersSnapshot(env: Env): Promise<void> {
     }
     if (t.spot_id && t.name) {
       spotNames.set(String(t.spot_id), t.name.trim())
+    }
+    if (t.client_id && t.client_id !== '0' && t.date_start) {
+      const prior = lastOrderByClient[t.client_id]
+      if (!prior || t.date_start > prior) {
+        lastOrderByClient[t.client_id] = t.date_start
+      }
     }
   }
 
@@ -186,6 +195,7 @@ export async function warmOrdersSnapshot(env: Env): Promise<void> {
       updatedAt: new Date().toISOString(),
       openOrders: dashArr.filter((t) => t.status === '1').length,
       closedOrders: dashArr.filter((t) => t.status === '2').length,
+      lastOrderByClient,
     }),
   )
 }

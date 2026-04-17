@@ -349,6 +349,21 @@ app.get('/users', async (c) => {
   const mappingRaw = await c.env.CONFIG.get('poster_to_fitkoh_users')
   const userMapping = parseUserMapping(mappingRaw)
 
+  // Per-client last order time (BAC-1149), derived from the cron-warmed
+  // live_orders_snapshot. Populated by warmOrdersSnapshot() in cache-warmer.ts.
+  const lastOrderByClient = await (async (): Promise<Record<string, string>> => {
+    try {
+      const raw = await c.env.CONFIG.get('live_orders_snapshot')
+      if (!raw) return {}
+      const snapshot = JSON.parse(raw) as {
+        lastOrderByClient?: Record<string, string>
+      }
+      return snapshot.lastOrderByClient ?? {}
+    } catch {
+      return {}
+    }
+  })()
+
   const posterClientById = new Map<
     number,
     {
@@ -411,6 +426,7 @@ app.get('/users', async (c) => {
       posterClosedBillsTotal: posterName.closedBillsTotal,
       posterFirstName: posterName.firstName,
       posterLastName: posterName.lastName,
+      lastOrderAt: null,
       fitkohUserId: mapping?.fitkohUserId ?? null,
       rezervUserId: mapping?.rezervUserId ?? null,
       hasClock: false,
@@ -471,6 +487,7 @@ app.get('/users', async (c) => {
       posterClosedBillsTotal: posterName.closedBillsTotal,
       posterFirstName: posterName.firstName,
       posterLastName: posterName.lastName,
+      lastOrderAt: null,
       fitkohUserId: mapping?.fitkohUserId ?? null,
       rezervUserId: mapping?.rezervUserId ?? null,
       hasClock: true,
@@ -506,6 +523,7 @@ app.get('/users', async (c) => {
       posterClosedBillsTotal: posterName.closedBillsTotal,
       posterFirstName: posterName.firstName,
       posterLastName: posterName.lastName,
+      lastOrderAt: null,
       fitkohUserId: mapping.fitkohUserId,
       rezervUserId: mapping.rezervUserId,
       hasClock: false,
@@ -515,21 +533,42 @@ app.get('/users', async (c) => {
     })
   }
 
+  // Attach the most recent order timestamp so the Guests tab can put the user
+  // with the freshest order at the top (BAC-1149). Rows without a Poster ID
+  // (Clock-only bookings) or no tracked order get null.
+  for (const row of rowsById.values()) {
+    row.lastOrderAt = row.posterId !== null
+      ? (lastOrderByClient[String(row.posterId)] ?? null)
+      : null
+  }
+
+  function parseOrderTs(raw: string | null): number {
+    if (!raw) return Number.NaN
+    const ts = new Date(raw.replace(' ', 'T')).getTime()
+    return Number.isFinite(ts) ? ts : Number.NaN
+  }
+
   const rows = Array.from(rowsById.values())
   rows.sort((a, b) => {
-    const aTs = a.posterCreatedAt
-      ? new Date(a.posterCreatedAt.replace(' ', 'T')).getTime()
-      : Number.NaN
-    const bTs = b.posterCreatedAt
-      ? new Date(b.posterCreatedAt.replace(' ', 'T')).getTime()
-      : Number.NaN
+    // Primary: most recent order first (nulls fall through).
+    const aOrder = parseOrderTs(a.lastOrderAt)
+    const bOrder = parseOrderTs(b.lastOrderAt)
+    const aOrderValid = Number.isFinite(aOrder)
+    const bOrderValid = Number.isFinite(bOrder)
+    if (aOrderValid && bOrderValid && aOrder !== bOrder) return bOrder - aOrder
+    if (aOrderValid && !bOrderValid) return -1
+    if (!aOrderValid && bOrderValid) return 1
 
+    // Secondary: Poster account creation, newest first.
+    const aTs = parseOrderTs(a.posterCreatedAt)
+    const bTs = parseOrderTs(b.posterCreatedAt)
     const aValid = Number.isFinite(aTs)
     const bValid = Number.isFinite(bTs)
     if (aValid && bValid) return bTs - aTs
     if (aValid) return -1
     if (bValid) return 1
 
+    // Tertiary: alphabetical by name.
     const aName = `${a.clockLastName || a.posterLastName || ''} ${a.clockFirstName || a.posterFirstName || ''}`.trim()
     const bName = `${b.clockLastName || b.posterLastName || ''} ${b.clockFirstName || b.posterFirstName || ''}`.trim()
     return aName.localeCompare(bName)

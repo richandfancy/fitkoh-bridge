@@ -133,6 +133,10 @@ export interface UserMatchRow {
   posterClosedBillsTotal: number
   posterFirstName: string | null
   posterLastName: string | null
+  // Most recent order line for this user, derived from live_orders_snapshot
+  // KV (warmed every 60s by cron). ISO 8601 string; null when no recent
+  // order is tracked for this client.
+  lastOrderAt: string | null
   fitkohUserId: number | null
   rezervUserId: string | null
   hasClock: boolean
