@@ -253,7 +253,7 @@ export function UsersPage() {
         <table className="w-full min-w-[1060px] text-sm">
           <thead>
             <tr className="border-b border-border text-muted-foreground text-xs">
-              <th className="text-left px-4 py-3 font-medium">Last Order</th>
+              <th className="text-left px-4 py-3 font-medium">Last Punch</th>
               <th className="text-left px-4 py-3 font-medium">Clock ID</th>
               <th className="text-left px-4 py-3 font-medium">Clock Firstname</th>
               <th className="text-left px-4 py-3 font-medium">Clock Lastname</th>

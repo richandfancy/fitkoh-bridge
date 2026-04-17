@@ -121,14 +121,16 @@ export async function warmOrdersSnapshot(env: Env): Promise<void> {
 
   const clientNames = new Map<string, string>()
   const spotNames = new Map<string, string>()
-  // Most recent order timestamp per client, normalized to ISO 8601 for the
-  // Guests tab sort (BAC-1149). Poster's `dash.getTransactions` returns
-  // date_start / date_close as unix-ms strings (e.g. "1776400559048"), not
-  // the "YYYY-MM-DD HH:MM:SS" format other Poster endpoints use — normalize
-  // here so consumers don't have to guess the format.
-  const lastOrderByClient: Record<string, string> = {}
+  // transactions.getTransactions (detailed) returns client_id=0 for most
+  // rows, so we can't use it to attribute punches to clients directly.
+  // dash.getTransactions does carry the real client_id — build a
+  // transaction_id → client_id map so each detailed row can be attributed.
+  const clientIdByTxn = new Map<number, string>()
   const dashArr = Array.isArray(dashTxns) ? dashTxns : []
 
+  // Poster mixes timestamp formats: dash.getTransactions uses unix-ms
+  // strings ("1776400559048"); transactions.getTransactions uses
+  // "YYYY-MM-DD HH:MM:SS". Normalize to ISO 8601 for comparison + display.
   function toIso(raw: string | undefined): string | null {
     if (!raw || raw === '0') return null
     const ms = Number(raw)
@@ -151,21 +153,25 @@ export async function warmOrdersSnapshot(env: Env): Promise<void> {
     if (t.spot_id && t.name) {
       spotNames.set(String(t.spot_id), t.name.trim())
     }
-    if (t.client_id && t.client_id !== '0') {
-      // Latest of start/close so closed bills reflect checkout time and
-      // open bills fall back to open time.
-      const startIso = toIso(t.date_start)
-      const closeIso = toIso(t.date_close)
-      const candidate =
-        startIso && closeIso
-          ? (startIso > closeIso ? startIso : closeIso)
-          : (startIso ?? closeIso)
-      if (candidate) {
-        const prior = lastOrderByClient[t.client_id]
-        if (!prior || candidate > prior) {
-          lastOrderByClient[t.client_id] = candidate
-        }
-      }
+    if (t.client_id && t.client_id !== '0' && t.transaction_id) {
+      clientIdByTxn.set(Number(t.transaction_id), t.client_id)
+    }
+  }
+
+  // Last punch per client — taken from the transaction's `date_close` on the
+  // detailed feed. Poster updates that field on every item-punch and on
+  // close/sign events, which is exactly what the Guests tab sort should
+  // reflect (BAC-1149). Clients whose transaction_id isn't in dashArr's
+  // client_id map simply don't contribute.
+  const lastOrderByClient: Record<string, string> = {}
+  for (const t of detailed) {
+    const clientIdStr = clientIdByTxn.get(t.transaction_id)
+    if (!clientIdStr) continue
+    const iso = toIso(t.date_close)
+    if (!iso) continue
+    const prior = lastOrderByClient[clientIdStr]
+    if (!prior || iso > prior) {
+      lastOrderByClient[clientIdStr] = iso
     }
   }
 
