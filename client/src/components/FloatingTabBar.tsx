@@ -26,6 +26,7 @@ export function FloatingTabBar({ onAddGuest, addDisabled }: FloatingTabBarProps)
 
   return (
     <nav
+      aria-label="Primary"
       className="no-print fixed inset-x-0 z-50 pointer-events-none"
       style={{ bottom: 'max(24px, env(safe-area-inset-bottom, 0px))' }}
     >
@@ -37,6 +38,8 @@ export function FloatingTabBar({ onAddGuest, addDisabled }: FloatingTabBarProps)
             return (
               <button
                 key={path}
+                type="button"
+                aria-current={active ? 'page' : undefined}
                 onClick={() => setLocation(path)}
                 className={cn(
                   'flex flex-col items-center justify-center gap-0.5 px-4 h-full transition-colors active:scale-[0.97]',
@@ -52,6 +55,7 @@ export function FloatingTabBar({ onAddGuest, addDisabled }: FloatingTabBarProps)
 
         {/* Plus pill */}
         <button
+          type="button"
           onClick={onAddGuest}
           disabled={addDisabled}
           aria-label="Create guest"

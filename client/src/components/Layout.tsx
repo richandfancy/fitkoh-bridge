@@ -26,7 +26,10 @@ export function Layout({ children }: { children: ReactNode }) {
 
       <main className="px-4 py-4 max-w-5xl mx-auto">{children}</main>
 
-      <FloatingTabBar onAddGuest={() => setIsDrawerOpen(true)} />
+      <FloatingTabBar
+        onAddGuest={() => setIsDrawerOpen(true)}
+        addDisabled={isDrawerOpen}
+      />
 
       <CreateGuestDrawer open={isDrawerOpen} onClose={() => setIsDrawerOpen(false)} />
     </div>
