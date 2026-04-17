@@ -42,6 +42,7 @@ export type ActivityType =
   | 'guest_created'
   | 'checkout'
   | 'charge_posted'
+  | 'cache_warmed'
   | 'error'
 export type BookingStatus = 'active' | 'checked_out' | 'synced'
 

@@ -16,9 +16,7 @@
 //   7. Record dispatched items in D1
 
 import type { Env } from '../env'
-import type { MealOrderedData } from '@shared/types'
 import { PosterClient } from './poster'
-import { dispatchEvent, generateEventId } from './webhook-dispatcher'
 
 interface UserMapping {
   fitkohUserId: number
@@ -33,6 +31,7 @@ interface DispatchableItem {
   quantity: number
   price: number
   fitkohMenuItemId: number | null
+  fitkohUserId: number
   transactionId: number
   logTime: string
 }
@@ -100,12 +99,19 @@ export async function autoImportNewMeals(env: Env): Promise<{
   // 2. Get today's date
   const today = new Date().toISOString().split('T')[0]
 
-  // 3. Fetch today's detailed transactions from Poster
+  // 3. Fetch today's transactions from Poster.
+  // Closed bills come from transactions.getTransactions with inline products.
+  // Open bills come from dash.getTransactions?status=1; we fetch per-line
+  // products separately for the mapped ones so a mapped diner's meal is
+  // dispatched the moment it's punched in, not when the bill closes.
   const poster = new PosterClient(env.POSTER_ACCESS_TOKEN)
-  const transactions = await poster.getDetailedTransactions(today, today, 500)
+  const todayCompact = today.replace(/-/g, '')
+  const [closedTxns, openTxns, products] = await Promise.all([
+    poster.getDetailedTransactions(today, today, 500),
+    poster.getOpenTransactions(todayCompact, todayCompact),
+    poster.getProducts(),
+  ])
 
-  // 4. Fetch product catalog ONCE (not per-item)
-  const products = await poster.getProducts()
   const productMap = new Map(
     products.map((p) => [
       String(p.product_id),
@@ -113,56 +119,85 @@ export async function autoImportNewMeals(env: Env): Promise<{
     ]),
   )
 
-  // 5. Find new items for mapped users. Each mapped transaction triggers one
-  // extra Poster call to fetch per-line punch-in times — cached per tick so a
-  // bill with N mapped products still costs just one extra call, not N.
+  // 4. Find new items for mapped users.
+  //
+  // We used to cross-reference two Poster endpoints (transactions.getTransactions
+  // for products, dash.getTransactionProducts for times) by array index. That's
+  // broken: the two endpoints return the same products in OPPOSITE orders, so
+  // each line got the time of another line on the same bill.
+  //
+  // Fix: dash.getTransactionProducts is now the single source of truth for
+  // product_id + time + num + price. Lines are sorted by time ascending before
+  // assigning the positional index, which keeps dedup keys stable across ticks.
   const dispatchableItems: DispatchableItem[] = []
-  const productTimesByTx = new Map<number, string[]>()
+  const productLinesByTx = new Map<number, Array<{ product_id: string; num: string; product_sum: string; time: string }>>()
 
-  for (const t of transactions) {
-    const clientIdStr = String(t.client_id)
-    if (!mappedClientIds.has(clientIdStr)) continue
-
-    let productTimes = productTimesByTx.get(t.transaction_id)
-    if (!productTimes) {
-      const lines = await poster.getTransactionProducts(t.transaction_id)
-      productTimes = lines.map((l) => l.time)
-      productTimesByTx.set(t.transaction_id, productTimes)
+  async function getSortedLines(transactionId: number) {
+    let lines = productLinesByTx.get(transactionId)
+    if (!lines) {
+      const raw = await poster.getTransactionProducts(transactionId)
+      lines = [...raw].sort((a, b) => Number(a.time) - Number(b.time))
+      productLinesByTx.set(transactionId, lines)
     }
+    return lines
+  }
 
-    for (let i = 0; i < (t.products || []).length; i++) {
-      const p = t.products[i]
-      const productIdStr = String(p.product_id)
-      const fitkohMenuItemId = itemMapping[productIdStr] ?? null
-
-      const itemId = `${clientIdStr}:${t.transaction_id}:${i}`
-      const logTime = punchInIsoOrFallback(productTimes[i], t.date_close, today)
-
-      const productName =
-        productMap.get(productIdStr) || `Product #${productIdStr}`
+  const itemMap = itemMapping // narrow the ?null to a stable local ref for the inner fn
+  const userMap = userMapping
+  function buildItemsForBill(clientIdStr: string, txId: number, lines: Array<{ product_id: string; num: string; product_sum: string; time: string }>, dateCloseFallback: string | undefined) {
+    const fitkohUserId = userMap[clientIdStr]?.fitkohUserId
+    if (!fitkohUserId) return // defensive: mappedClientIds was derived from userMap; this should never trigger
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i]
+      const productIdStr = String(l.product_id)
+      const fitkohMenuItemId = itemMap[productIdStr] ?? null
+      const productName = productMap.get(productIdStr) || `Product #${productIdStr}`
 
       dispatchableItems.push({
-        id: itemId,
+        id: `${clientIdStr}:${txId}:${i}`,
         posterClientId: Number(clientIdStr),
         posterProductId: productIdStr,
         productName,
-        quantity: Number(p.num || 1),
-        price: Number(p.product_sum || 0),
+        quantity: Number(l.num || 1),
+        price: Number(l.product_sum || 0),
         fitkohMenuItemId,
-        transactionId: t.transaction_id,
-        logTime,
+        fitkohUserId,
+        transactionId: txId,
+        logTime: punchInIsoOrFallback(l.time, dateCloseFallback, today),
       })
     }
   }
 
+  // 4a. Closed bills.
+  for (const t of closedTxns) {
+    const clientIdStr = String(t.client_id)
+    if (!mappedClientIds.has(clientIdStr)) continue
+
+    const lines = await getSortedLines(t.transaction_id)
+    buildItemsForBill(clientIdStr, t.transaction_id, lines, t.date_close)
+  }
+
+  // 4b. Open bills — same path, dedup guarantees no redispatch when the bill
+  // later appears as closed (same transactionId, same product-index assignment
+  // because lines are deterministically sorted by time).
+  for (const t of openTxns) {
+    const clientIdStr = String(t.client_id)
+    if (!mappedClientIds.has(clientIdStr)) continue
+
+    const txId = Number(t.transaction_id)
+    const lines = await getSortedLines(txId)
+    buildItemsForBill(clientIdStr, txId, lines, undefined)
+  }
+
+  const totalChecked = closedTxns.length + openTxns.length
   if (dispatchableItems.length === 0) {
-    return { checked: transactions.length, dispatched: 0, skipped: 0, errors: 0 }
+    return { checked: totalChecked, dispatched: 0, skipped: 0, errors: 0 }
   }
 
   const { dispatched, errors } = await deduplicateAndDispatch(env, dispatchableItems)
 
   return {
-    checked: transactions.length,
+    checked: totalChecked,
     dispatched,
     skipped: dispatchableItems.length - dispatched - errors,
     errors,
@@ -195,47 +230,56 @@ export async function importItemsForUser(
   const mappedClientIds = new Set(Object.keys(userMapping))
   const dispatchableItems: DispatchableItem[] = []
 
-  // The SSE stream carries bill-close time in `item.time`, not the punch-in
-  // time we want. Fetch per-line times for each transaction this call touches,
-  // cached so a bill with multiple mapped lines only costs one extra call.
+  // The SSE stream's payload is positionally unreliable (its productIndex was
+  // built from transactions.getTransactions order, which is the reverse of
+  // dash.getTransactionProducts). We ignore it and rebuild the full set of
+  // lines for each affected transaction from dash.getTransactionProducts,
+  // sorted by time so dedup indices match the cron path's indices.
   const poster = new PosterClient(env.POSTER_ACCESS_TOKEN)
-  const productTimesByTx = new Map<number, string[]>()
+  const linesByTx = new Map<number, Array<{ product_id: string; num: string; product_sum: string; time: string }>>()
+  const txsToFetch = new Set<number>()
 
   for (const item of newItems) {
     const clientIdStr = item.clientId != null ? String(item.clientId) : null
-    if (!clientIdStr || !mappedClientIds.has(clientIdStr)) continue
-
-    const productIdStr = String(item.productId)
-    const fitkohMenuItemId = itemMapping[productIdStr] ?? null
-
-    // Reconstruct the same dedup ID format used by the cron path:
-    // clientId:transactionId:productIndex
-    // The SSE item id is "transactionId-productIndex", so extract the index
-    const dashIdx = item.id.lastIndexOf('-')
-    const productIndexStr = dashIdx >= 0 ? item.id.substring(dashIdx + 1) : '0'
-    const productIndex = Number(productIndexStr)
-    const dedupId = `${clientIdStr}:${item.transactionId}:${productIndexStr}`
-
-    let productTimes = productTimesByTx.get(item.transactionId)
-    if (!productTimes) {
-      const lines = await poster.getTransactionProducts(item.transactionId)
-      productTimes = lines.map((l) => l.time)
-      productTimesByTx.set(item.transactionId, productTimes)
+    if (clientIdStr && mappedClientIds.has(clientIdStr)) {
+      txsToFetch.add(item.transactionId)
     }
+  }
 
-    const logTime = punchInIsoOrFallback(productTimes[productIndex], item.time, today)
+  const mappedClientByTx = new Map<number, string>()
+  for (const item of newItems) {
+    const clientIdStr = item.clientId != null ? String(item.clientId) : null
+    if (clientIdStr && mappedClientIds.has(clientIdStr)) {
+      mappedClientByTx.set(item.transactionId, clientIdStr)
+    }
+  }
 
-    dispatchableItems.push({
-      id: dedupId,
-      posterClientId: Number(clientIdStr),
-      posterProductId: productIdStr,
-      productName: item.productName,
-      quantity: item.quantity,
-      price: item.price,
-      fitkohMenuItemId,
-      transactionId: item.transactionId,
-      logTime,
-    })
+  for (const txId of txsToFetch) {
+    const raw = await poster.getTransactionProducts(txId)
+    const lines = [...raw].sort((a, b) => Number(a.time) - Number(b.time))
+    linesByTx.set(txId, lines)
+
+    const clientIdStr = mappedClientByTx.get(txId)!
+    const fitkohUserId = userMapping[clientIdStr]?.fitkohUserId
+    if (!fitkohUserId) continue
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i]
+      const productIdStr = String(l.product_id)
+      const fitkohMenuItemId = itemMapping[productIdStr] ?? null
+
+      dispatchableItems.push({
+        id: `${clientIdStr}:${txId}:${i}`,
+        posterClientId: Number(clientIdStr),
+        posterProductId: productIdStr,
+        productName: `Product #${productIdStr}`,
+        quantity: Number(l.num || 1),
+        price: Number(l.product_sum || 0),
+        fitkohMenuItemId,
+        fitkohUserId,
+        transactionId: txId,
+        logTime: punchInIsoOrFallback(l.time, undefined, today),
+      })
+    }
   }
 
   if (dispatchableItems.length === 0) return 0
@@ -245,8 +289,57 @@ export async function importItemsForUser(
 }
 
 // ---------------------------------------------------------------------------
-// Shared: dedup against D1 -> dispatch webhook events -> record in D1
+// Shared: dedup against D1 -> log to FitKoh trainer endpoint -> record in D1
+//
+// BAC-1068: The bridge authenticates to FitKoh as a trainer user (via
+// X-API-Key on tRPC), and calls collaborate.logItemForClient directly.
+// Replaces the previous webhook dispatcher: one auth model, one permissions
+// model (shared_access), one audit trail per FitKoh's user table.
 // ---------------------------------------------------------------------------
+
+async function logToFitkoh(
+  env: Env,
+  item: DispatchableItem,
+): Promise<void> {
+  if (!env.FITKOH_API_URL || !env.FITKOH_API_KEY) {
+    throw new Error('FITKOH_API_URL / FITKOH_API_KEY not configured')
+  }
+  if (item.fitkohMenuItemId == null) {
+    // No menu mapping — nothing to log. Treated as success so the dedup
+    // row stays claimed and we don't re-try every tick for unmapped items.
+    return
+  }
+  const logDate = item.logTime.slice(0, 10)
+  const body = {
+    json: {
+      ownerId: item.fitkohUserId,
+      menuItemId: item.fitkohMenuItemId,
+      logDate,
+      logTime: item.logTime,
+      quantity: item.quantity || 1,
+      itemType: 'food',
+      // BAC-1071: idempotency key, identical to this row's bridge D1 id
+      // (`clientId:txId:lineIndex`). Retries after a lost response resolve
+      // to the same FitKoh row via ON CONFLICT DO NOTHING on source_id.
+      sourceId: `poster:${item.id}`,
+    },
+  }
+  const resp = await fetch(
+    `${env.FITKOH_API_URL}/api/trpc/collaborate.logItemForClient`,
+    {
+      method: 'POST',
+      headers: {
+        'x-api-key': env.FITKOH_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    },
+  )
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '')
+    throw new Error(`FitKoh logItemForClient ${resp.status}: ${text.slice(0, 200)}`)
+  }
+}
 
 async function deduplicateAndDispatch(
   env: Env,
@@ -273,25 +366,8 @@ async function deduplicateAndDispatch(
 
       if (result.meta.changes === 0) continue // Already dispatched by another path
 
-      // This is genuinely new -- dispatch webhook
-      const eventData: MealOrderedData = {
-        posterClientId: item.posterClientId,
-        posterProductId: item.posterProductId,
-        productName: item.productName,
-        quantity: item.quantity,
-        price: item.price,
-        fitkohMenuItemId: item.fitkohMenuItemId,
-        transactionId: item.transactionId,
-        time: item.logTime,
-      }
-
-      await dispatchEvent(env, {
-        id: generateEventId(),
-        type: 'meal.ordered',
-        timestamp: new Date().toISOString(),
-        data: eventData,
-      })
-
+      // This is genuinely new — log directly to FitKoh as the bridge trainer.
+      await logToFitkoh(env, item)
       dispatched++
     } catch (err) {
       // If dispatch fails after the INSERT OR IGNORE claimed the item,

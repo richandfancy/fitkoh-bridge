@@ -148,8 +148,9 @@ export class PosterClient {
   }
 
   // Open (in-progress) transactions for a date range. Returns bills where
-  // the check hasn't been closed yet — used for the per-user open-bill totals
-  // on the Guests/UsersPage dashboard.
+  // date_close is "0" — used for per-user open-bill totals on the
+  // Guests/UsersPage dashboard and to ship items to FitKoh the moment
+  // they're punched in, without waiting for the check to close.
   async getOpenTransactions(
     dateFrom: string,
     dateTo: string,

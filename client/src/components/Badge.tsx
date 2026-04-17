@@ -5,6 +5,7 @@ const VARIANTS = {
   guest_created: 'bg-status-green/15 text-status-green',
   checkout: 'bg-status-amber/15 text-status-amber',
   charge_posted: 'bg-status-green/15 text-status-green',
+  cache_warmed: 'bg-status-blue/15 text-status-blue',
   error: 'bg-status-red/15 text-status-red',
   active: 'bg-status-blue/15 text-status-blue',
   checked_out: 'bg-status-amber/15 text-status-amber',

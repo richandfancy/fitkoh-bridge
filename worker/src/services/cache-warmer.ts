@@ -76,18 +76,19 @@ export async function warmMealsCache(env: Env): Promise<{
   const errors = results.filter((r) => !r.ok).length
   const durationMs = Date.now() - start
 
-  // Record summary in activity_log so the dashboard surfaces cron health.
-  // We reuse the 'guest_created' ActivityType for now — a dedicated
-  // 'cache_warm' type can be added later without schema changes.
-  await env.DB.prepare(
-    'INSERT INTO activity_log (type, summary, payload) VALUES (?, ?, ?)',
-  )
-    .bind(
-      'guest_created',
-      `Pre-warmed cache: ${warmed} entries, ${errors} errors, ${durationMs}ms`,
-      JSON.stringify({ warmed, errors, durationMs }),
+  // Only record anomalies in activity_log — successful fast warms would
+  // otherwise generate 1440 rows/day and drown real events in noise.
+  if (errors > 0 || durationMs > 5000) {
+    await env.DB.prepare(
+      'INSERT INTO activity_log (type, summary, payload) VALUES (?, ?, ?)',
     )
-    .run()
+      .bind(
+        'cache_warmed',
+        `Pre-warmed cache: ${warmed} entries, ${errors} errors, ${durationMs}ms`,
+        JSON.stringify({ warmed, errors, durationMs }),
+      )
+      .run()
+  }
 
   return { warmed, errors, durationMs }
 }
