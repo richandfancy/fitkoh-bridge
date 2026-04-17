@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { X, Loader2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { toast } from 'sonner'
@@ -28,11 +28,11 @@ export function CreateGuestDrawer({ open, onClose }: CreateGuestDrawerProps) {
   const [city, setCity] = useState('')
   const [address, setAddress] = useState('')
 
-  const hasGroup = typeof groupId === 'number' && groupId > 0
-  const hasIdentity = Boolean(
-    firstName.trim() || lastName.trim() || phone.trim() || email.trim(),
-  )
-  const canCreate = hasGroup && hasIdentity && !creating
+  const canCreate = useMemo(() => {
+    const hasGroup = typeof groupId === 'number' && groupId > 0
+    const hasIdentity = firstName.trim() || lastName.trim() || phone.trim() || email.trim()
+    return hasGroup && !!hasIdentity && !creating
+  }, [groupId, firstName, lastName, phone, email, creating])
 
   useEffect(() => {
     if (!open) return
@@ -91,7 +91,6 @@ export function CreateGuestDrawer({ open, onClose }: CreateGuestDrawerProps) {
             <p className="text-xs text-muted-foreground">Creates a client directly in Poster</p>
           </div>
           <button
-            type="button"
             onClick={onClose}
             className="p-2 rounded-xl hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
             aria-label="Close drawer"
@@ -190,7 +189,6 @@ export function CreateGuestDrawer({ open, onClose }: CreateGuestDrawerProps) {
 
         <div className="px-4 py-3 border-t border-border flex items-center justify-end gap-2 bg-card">
           <button
-            type="button"
             onClick={onClose}
             className="px-4 py-2 rounded-xl bg-secondary text-foreground text-sm font-semibold hover:opacity-95 transition-opacity"
             disabled={creating}
@@ -198,7 +196,6 @@ export function CreateGuestDrawer({ open, onClose }: CreateGuestDrawerProps) {
             Cancel
           </button>
           <button
-            type="button"
             onClick={handleCreate}
             disabled={!canCreate}
             className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold disabled:opacity-50 transition-opacity flex items-center gap-2"
