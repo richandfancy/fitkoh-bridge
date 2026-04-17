@@ -47,6 +47,30 @@ app.get('/api/health', (c) => {
   return c.json({ ok: true, environment: c.env.ENVIRONMENT })
 })
 
+// Service worker + manifest: fetch from ASSETS binding and override caching.
+// The SW file itself must never be cached — PWA update detection works by
+// byte-diffing the old installed SW against a freshly-fetched sw.js. Any
+// caching on this route makes deploys invisible for the TTL.
+// See ~/.claude/playbooks/pwa-playbook.md §1.
+async function serveUncached(c: { env: Env; req: { url: string; raw: Request } }, contentType: string) {
+  const response = await c.env.ASSETS.fetch(c.req.raw)
+  if (!response.ok) return response
+  const headers = new Headers(response.headers)
+  headers.set('Content-Type', contentType)
+  headers.set('Cache-Control', 'no-cache, no-store, must-revalidate')
+  headers.set('Pragma', 'no-cache')
+  headers.set('Expires', '0')
+  return new Response(response.body, { status: response.status, headers })
+}
+
+app.get('/sw.js', async (c) => {
+  const res = await serveUncached(c, 'application/javascript')
+  res.headers.set('Service-Worker-Allowed', '/')
+  return res
+})
+
+app.get('/manifest.json', (c) => serveUncached(c, 'application/manifest+json'))
+
 // Docs and schema are gated behind HTTP Basic auth so the API surface
 // isn't discoverable to anyone who stumbles on the domain.
 app.use('/docs', docsAuth)

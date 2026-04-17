@@ -3,6 +3,7 @@ import { Toaster } from 'sonner'
 import { AuthProvider, useAuth } from '@/contexts/auth-context'
 import { Layout } from '@/components/Layout'
 import { LoginScreen } from '@/components/LoginScreen'
+import { InstallPrompt } from '@/components/InstallPrompt'
 import { Loader2 } from 'lucide-react'
 
 // Lazy-loaded pages (create stubs for now)
@@ -51,6 +52,7 @@ export function App() {
   return (
     <AuthProvider>
       <AppContent />
+      <InstallPrompt />
       <Toaster theme="dark" position="top-center" />
     </AuthProvider>
   )

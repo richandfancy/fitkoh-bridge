@@ -86,3 +86,12 @@ body {
   body { background: white; color: black; }
   html { background: white; }
 }
+
+/* Safe-area utilities — consumed by floating chrome (tab bar, banners) when
+ * the app runs as an installed PWA on devices with home indicators / notches.
+ * env(safe-area-inset-*) resolves to 0 in regular browsers.
+ */
+@utility pt-safe { padding-top: env(safe-area-inset-top, 0px); }
+@utility pb-safe { padding-bottom: env(safe-area-inset-bottom, 0px); }
+@utility pl-safe { padding-left: env(safe-area-inset-left, 0px); }
+@utility pr-safe { padding-right: env(safe-area-inset-right, 0px); }
