@@ -408,32 +408,34 @@ export function OrdersPage() {
                 : 'border-border',
             )}
           >
-            {/* Transaction header */}
-            <div className="px-4 py-2 flex items-center justify-between border-b border-border/50 bg-background/30">
-              <div className="flex items-center gap-2 text-xs">
-                <span className="font-mono text-muted-foreground">
-                  {formatTime(group.time)}
+            {/* Transaction header — two rows so guest name + location
+                aren't truncated on mobile. */}
+            <div className="px-4 py-2 border-b border-border/50 bg-background/30">
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="font-mono text-muted-foreground shrink-0">
+                    {formatTime(group.time)}
+                  </span>
+                  <span className="text-muted-foreground">·</span>
+                  <span className="font-medium text-foreground shrink-0">
+                    Table {group.table}
+                  </span>
+                </div>
+                <span className="text-muted-foreground tabular-nums shrink-0">
+                  {formatRelative(group.time)}
                 </span>
-                <span className="text-muted-foreground">·</span>
-                <span className="font-medium text-foreground">
-                  Table {group.table}
-                </span>
-                <span className="text-muted-foreground">·</span>
-                <span className="text-muted-foreground truncate">
-                  {group.location}
-                </span>
-                {group.clientName && (
-                  <>
-                    <span className="text-muted-foreground">·</span>
-                    <span className="text-muted-foreground truncate">
-                      {group.clientName}
-                    </span>
-                  </>
-                )}
               </div>
-              <span className="text-xs text-muted-foreground tabular-nums shrink-0 ml-2">
-                {formatRelative(group.time)}
-              </span>
+              {(group.location || group.clientName) && (
+                <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground min-w-0">
+                  <span className="truncate">{group.location}</span>
+                  {group.clientName && (
+                    <>
+                      <span className="shrink-0">·</span>
+                      <span className="truncate">{group.clientName}</span>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* Items */}
