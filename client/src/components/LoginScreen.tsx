@@ -6,6 +6,7 @@ const AUTH_ERROR_MESSAGES: Record<string, string> = {
   expired: 'That sign-in link has expired. Request a new one below.',
   invalid: "That sign-in link wasn't valid. Request a new one below.",
   not_allowlisted: "That email isn't authorized to access the dashboard.",
+  reused: 'That sign-in link has already been used. Request a new one below.',
 }
 
 function readAuthErrorFromUrl(): string | null {

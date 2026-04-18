@@ -57,8 +57,11 @@ function buildCallbackUrl(c: {
   req: { url: string }
   env: Env
 }, token: string): string {
-  // Use the request's own origin so staging/prod/localhost all work.
-  const origin = new URL(c.req.url).origin
+  // Prefer APP_ORIGIN (set via wrangler.toml) so the callback link can't be
+  // spoofed by sending request-link with a crafted Host header (BAC-1212).
+  // Fall back to the request origin only when APP_ORIGIN is unset — needed
+  // for `wrangler dev` against arbitrary localhost ports.
+  const origin = c.env.APP_ORIGIN ?? new URL(c.req.url).origin
   return `${origin}/auth/callback?token=${encodeURIComponent(token)}`
 }
 
@@ -156,7 +159,9 @@ auth.post('/api/auth/request-link', async (c) => {
 
 auth.get('/auth/callback', async (c) => {
   const token = c.req.query('token')
-  const origin = new URL(c.req.url).origin
+  // Prefer the canonical origin for the redirect target too — keeps users
+  // on the trusted host even if the callback was reached via a spoofed one.
+  const origin = c.env.APP_ORIGIN ?? new URL(c.req.url).origin
 
   if (!token) {
     return c.redirect(`${origin}/?auth_error=invalid`, 302)
@@ -171,6 +176,17 @@ auth.get('/auth/callback', async (c) => {
   if (!allowlist.has(verified.email)) {
     return c.redirect(`${origin}/?auth_error=not_allowlisted`, 302)
   }
+
+  // Enforce single-use (BAC-1212). Keyed by the token's HMAC, which is
+  // high-entropy and stable. TTL outlives the token itself so a replay after
+  // natural expiry still hits the "used" record rather than looking fresh.
+  const used = await c.env.CONFIG.get(`auth:used:${verified.hmac}`)
+  if (used) return c.redirect(`${origin}/?auth_error=reused`, 302)
+  await c.env.CONFIG.put(
+    `auth:used:${verified.hmac}`,
+    '1',
+    { expirationTtl: Math.max(60, Math.ceil((verified.expiresAt - Date.now()) / 1000)) },
+  )
 
   const isProduction = c.env.ENVIRONMENT === 'production'
   const sessionToken = await createSessionToken(c.env.DASHBOARD_SECRET)

@@ -119,14 +119,19 @@ export async function createMagicLinkToken(
 }
 
 /**
- * Verify a magic-link token. Returns the email on success, null on failure
- * (malformed, expired, or bad signature). Does NOT check allowlist — callers
- * must do that separately after decoding.
+ * Verify a magic-link token. Returns `{ email, hmac, expiresAt }` on success,
+ * null on failure (malformed, expired, or bad signature). Does NOT check the
+ * allowlist — callers must do that separately after decoding.
+ *
+ * The `hmac` is the signature component of the token; callers use it as a
+ * stable, high-entropy key for single-use enforcement (BAC-1212). `expiresAt`
+ * is the token's absolute expiry in unix-ms, so callers can size the
+ * single-use KV record's TTL to outlive the token itself.
  */
 export async function verifyMagicLinkToken(
   secret: string,
   token: string,
-): Promise<{ email: string } | null> {
+): Promise<{ email: string; hmac: string; expiresAt: number } | null> {
   const parts = token.split('.')
   if (parts.length !== 3) return null
 
@@ -143,5 +148,5 @@ export async function verifyMagicLinkToken(
   const expected = await hmacSha256(secret, `magic:${email}.${expiresMs}`)
   if (!constantTimeEqual(expected, sig)) return null
 
-  return { email }
+  return { email, hmac: sig, expiresAt: expiresMs }
 }
