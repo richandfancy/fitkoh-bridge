@@ -1,8 +1,41 @@
+import { captureException } from '@sentry/cloudflare'
+import { z } from 'zod'
 import type {
   PosterClient as PosterClientType,
   PosterTransaction,
   PosterTransactionHistoryEntry,
 } from '@shared/types'
+import {
+  PosterDetailedTransactionSchema,
+  PosterTransactionSchema,
+} from '@shared/poster-schemas'
+
+// Parse a Poster response against a Zod schema and report drift to Sentry
+// without blowing up the caller. Returns `[]` on failure so the bridge
+// degrades gracefully — the dashboards render "no orders" instead of a 500.
+//
+// TODO(BAC-1221): cover the drift-alert branch with a unit test (feed an
+// obviously-malformed array, assert captureException called with
+// `subsystem: 'poster-schema'`).
+function parsePosterArray<T>(
+  schema: z.ZodType<T>,
+  endpoint: string,
+  result: unknown,
+): T[] {
+  const parsed = z.array(schema).safeParse(result)
+  if (parsed.success) return parsed.data
+
+  captureException(new Error('Poster schema drift'), {
+    tags: { endpoint, subsystem: 'poster-schema' },
+    extra: {
+      issues: parsed.error.issues,
+      // Log only a small sample of the payload so we don't leak PII into
+      // Sentry but still have enough context to diagnose.
+      sample: Array.isArray(result) ? result.slice(0, 1) : result,
+    },
+  })
+  return []
+}
 
 // Module-level cache for products (P2 fix)
 let cachedProducts: Array<{
@@ -97,11 +130,20 @@ export class PosterClient {
     dateTo: string,
     params?: Record<string, string>,
   ): Promise<PosterTransaction[]> {
-    return this.request('dash.getTransactions', {
+    const result = await this.request<unknown>('dash.getTransactions', {
       dateFrom,
       dateTo,
       ...params,
     })
+    // Schema validated at runtime; on drift we alert + return [] rather
+    // than crashing the cron or /orders handler. PosterTransactionSchema
+    // transforms `client_id` / `transaction_id` to strings so the parsed
+    // shape satisfies the existing PosterTransaction type.
+    return parsePosterArray(
+      PosterTransactionSchema,
+      'dash.getTransactions',
+      result,
+    ) as unknown as PosterTransaction[]
   }
 
   async getTransaction(
@@ -151,16 +193,14 @@ export class PosterClient {
   // date_close is "0" — used for per-user open-bill totals on the
   // Guests/UsersPage dashboard and to ship items to FitKoh the moment
   // they're punched in, without waiting for the check to close.
+  //
+  // Delegates to getTransactions so the same Zod validation + drift
+  // alerting applies here.
   async getOpenTransactions(
     dateFrom: string,
     dateTo: string,
   ): Promise<PosterTransaction[]> {
-    const result = await this.request<PosterTransaction[]>('dash.getTransactions', {
-      dateFrom,
-      dateTo,
-      status: '1',
-    })
-    return Array.isArray(result) ? result : []
+    return this.getTransactions(dateFrom, dateTo, { status: '1' })
   }
 
   // Per-line products for a single transaction. The `time` field is the
@@ -189,7 +229,11 @@ export class PosterClient {
     return result || []
   }
 
-  // Detailed transactions with inline products — used for live item feed
+  // Detailed transactions with inline products — used for live item feed.
+  //
+  // Runtime-validated with PosterDetailedTransactionSchema so a field
+  // rename or type flip on Poster's side surfaces as a Sentry drift alert
+  // instead of a NaN bill total or a silently-missing punch.
   async getDetailedTransactions(
     dateFrom: string,
     dateTo: string,
@@ -208,25 +252,34 @@ export class PosterClient {
       }>
     }>
   > {
-    const raw = await this.request<{
-      data: Array<{
-        transaction_id: number
-        date_close: string
-        client_id: number
-        table_id: number
-        spot_id: number
-        products: Array<{
-          product_id: number
-          num: number
-          product_sum: string
-        }>
-      }>
-    }>('transactions.getTransactions', {
+    const raw = await this.request<unknown>('transactions.getTransactions', {
       date_from: dateFrom,
       date_to: dateTo,
       per_page: String(perPage),
     })
-    return raw?.data || []
+    // The detailed feed wraps its array under a `data` key; the rest of
+    // the response (pagination, counts) is ignored.
+    const data =
+      raw && typeof raw === 'object' && 'data' in raw
+        ? (raw as { data: unknown }).data
+        : []
+
+    return parsePosterArray(
+      PosterDetailedTransactionSchema,
+      'transactions.getTransactions',
+      data,
+    ) as Array<{
+      transaction_id: number
+      date_close: string
+      client_id: number
+      table_id: number
+      spot_id: number
+      products: Array<{
+        product_id: number
+        num: number
+        product_sum: string
+      }>
+    }>
   }
 
   // For pre-invoice: get all transactions for a specific client in a date range.

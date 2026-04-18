@@ -11,6 +11,10 @@ import {
   resolveDeadLetter,
 } from '../db/queries'
 import { MockClockClient } from '../services/clock-mock'
+import {
+  buildOrdersSnapshot,
+  readSnapshotFromKv,
+} from '../services/orders-feed'
 import { PosterClient } from '../services/poster'
 import type {
   PreInvoiceResponse,
@@ -101,73 +105,38 @@ app.get('/stats', async (c) => {
 // For today's date, reads from the KV `live_orders_snapshot` (warmed by cron
 // every 60s) to avoid hitting Poster on every dashboard load. Falls back to
 // a live Poster fetch for historical dates or if KV is stale.
+//
+// Thin wrapper around orders-feed — `readSnapshotFromKv` for the hot path,
+// `buildOrdersSnapshot` for historical dates / stale KV.
+//
+// TODO(BAC-1221): integration tests for the KV-hit / KV-miss / historical-date
+// branches and the response-shape contract the frontend depends on.
 app.get('/orders', async (c) => {
   const date = c.req.query('date') // YYYY-MM-DD optional, defaults to today
   const today = new Date().toISOString().split('T')[0]
   const target = date || today
 
-  // Try KV snapshot for today's data
+  // Hot path: today's data served from KV.
   if (target === today) {
-    try {
-      const raw = await c.env.CONFIG.get('live_orders_snapshot')
-      if (raw) {
-        const snapshot = JSON.parse(raw) as {
-          date: string
-          items: Array<{
-            id: string
-            time: string
-            productId: number
-            productName: string
-            quantity: number
-            price: number
-            table: number
-            location: string
-            clientName: string | null
-            clientId: number | null
-            transactionId: number
-          }>
-          updatedAt: string
-          openOrders: number
-          closedOrders: number
-        }
-        const age = Date.now() - new Date(snapshot.updatedAt).getTime()
-        if (age < 90_000 && snapshot.date === today) {
-          // Return from KV — items are oldest-first, reverse for dashboard
-          const items = [...snapshot.items].reverse()
-          return c.json({
-            date: target,
-            totalItems: items.length,
-            openOrders: snapshot.openOrders,
-            closedOrders: snapshot.closedOrders,
-            items,
-          })
-        }
-      }
-    } catch {
-      // KV read failed — fall through to live fetch
+    const snapshot = await readSnapshotFromKv(c.env.CONFIG, { today })
+    if (snapshot) {
+      // Snapshot stores items oldest-first; dashboard wants newest-first.
+      const items = [...snapshot.items].reverse()
+      return c.json({
+        date: target,
+        totalItems: items.length,
+        openOrders: snapshot.openOrders,
+        closedOrders: snapshot.closedOrders,
+        items,
+      })
     }
   }
 
   // Fallback: live Poster fetch (historical dates or stale KV).
-  // NOTE (Q1): This fetch-and-flatten logic mirrors warmOrdersSnapshot() in
-  // cache-warmer.ts. The duplication is intentional — the cron warms KV for
-  // today's data (the hot path above), while this fallback handles historical
-  // dates and serves as a resilience path when KV is stale or unavailable.
   const poster = new PosterClient(c.env.POSTER_ACCESS_TOKEN)
-
-  let transactions: Awaited<ReturnType<typeof poster.getDetailedTransactions>> = []
-  let products: Awaited<ReturnType<typeof poster.getProducts>> = []
-  let dashTxns: Awaited<ReturnType<typeof poster.getTransactions>> = []
-
+  let snapshot
   try {
-    const [txnsResult, productsResult, dashResult] = await Promise.all([
-      poster.getDetailedTransactions(target, target),
-      poster.getProducts(),
-      poster.getTransactions(target.replace(/-/g, ''), target.replace(/-/g, '')),
-    ])
-    transactions = txnsResult
-    products = productsResult
-    dashTxns = Array.isArray(dashResult) ? dashResult : []
+    snapshot = await buildOrdersSnapshot(poster, { today: target })
   } catch (err) {
     return c.json(
       {
@@ -177,73 +146,12 @@ app.get('/orders', async (c) => {
     )
   }
 
-  const productMap = new Map(
-    products.map((p) => [
-      String(p.product_id),
-      (p.product_name || '').replace(/^food_/, ''),
-    ]),
-  )
-
-  const clientNames = new Map<string, string>()
-  const spotNames = new Map<string, string>()
-  for (const t of dashTxns) {
-    if (t.client_id && t.client_id !== '0' && (t.client_firstname || t.client_lastname)) {
-      clientNames.set(
-        t.client_id,
-        `${t.client_lastname || ''} ${t.client_firstname || ''}`.trim(),
-      )
-    }
-    if (t.spot_id && t.name) {
-      spotNames.set(String(t.spot_id), t.name.trim())
-    }
-  }
-
-  type LiveItem = {
-    id: string
-    time: string
-    productId: number
-    productName: string
-    quantity: number
-    price: number
-    table: number
-    location: string
-    clientName: string | null
-    transactionId: number
-  }
-
-  const items: LiveItem[] = []
-  for (const t of transactions) {
-    const location = spotNames.get(String(t.spot_id)) || 'Unknown'
-    const clientName = clientNames.get(String(t.client_id)) || null
-
-    for (let i = 0; i < (t.products || []).length; i++) {
-      const p = t.products[i]
-      const productIdStr = String(p.product_id)
-      const name = productMap.get(productIdStr) || `Product #${productIdStr}`
-      items.push({
-        id: `${t.transaction_id}-${i}`,
-        time: t.date_close,
-        productId: p.product_id,
-        productName: name,
-        quantity: Number(p.num || 1),
-        price: Number(p.product_sum || 0),
-        table: t.table_id,
-        location,
-        clientName,
-        transactionId: t.transaction_id,
-      })
-    }
-  }
-
-  items.sort((a, b) => b.time.localeCompare(a.time))
-
-  const openOrders = dashTxns.filter((t) => t.status === '1').length
-
+  const items = [...snapshot.items].reverse()
   return c.json({
     date: target,
     totalItems: items.length,
-    openOrders,
-    closedOrders: dashTxns.filter((t) => t.status === '2').length,
+    openOrders: snapshot.openOrders,
+    closedOrders: snapshot.closedOrders,
     items,
   })
 })
@@ -350,10 +258,12 @@ app.get('/users', async (c) => {
   const userMapping = parseUserMapping(mappingRaw)
 
   // Per-client last punch (BAC-1149), derived from the cron-warmed
-  // live_orders_snapshot. Populated by warmOrdersSnapshot() — reads from
-  // dash.getTransactionHistory for open transactions. Reads
-  // `lastPunchByClient` with a fallback to the legacy `lastOrderByClient`
-  // key so older snapshots still sort correctly during rollout.
+  // live_orders_snapshot. Populated by buildOrdersSnapshot() — reads from
+  // dash.getTransactionHistory for open transactions. Falls back to the
+  // legacy `lastOrderByClient` key so older snapshots still sort correctly
+  // during rollout. Staleness is tolerated here: we read via KV key directly
+  // rather than readSnapshotFromKv() because even an old snapshot beats a
+  // blank "Last Punch" column on the Guests tab.
   const lastPunchByClient = await (async (): Promise<Record<string, string>> => {
     try {
       const raw = await c.env.CONFIG.get('live_orders_snapshot')
