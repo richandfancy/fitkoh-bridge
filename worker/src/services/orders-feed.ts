@@ -15,6 +15,8 @@
 // Anything that changes the `OrdersSnapshot` shape below MUST be audited
 // against those three callers before shipping.
 
+import { captureMessage } from '@sentry/cloudflare'
+
 import type { PosterClient } from './poster'
 
 // Flattened live order item (one row per product line across all of today's
@@ -308,13 +310,69 @@ export async function readSnapshotFromKv(
   }
 }
 
+// How long a prior non-empty snapshot remains "authoritative" for the purposes
+// of suppressing an empty overwrite (BAC-1218). Longer than the 90s read
+// staleness threshold because even a stale-for-reads snapshot is still better
+// than nuking the whole feed on a single transient Poster blank response.
+const EMPTY_OVERWRITE_PROTECTION_MS = 5 * 60 * 1000
+
+function isSnapshotEmpty(snapshot: OrdersSnapshot): boolean {
+  const hasItems = snapshot.items.length > 0
+  const hasPunches = Object.keys(snapshot.lastPunchByClient ?? {}).length > 0
+  return !hasItems && !hasPunches
+}
+
 /**
  * Persist a built snapshot to KV. Plain JSON, no TTL — the cron keeps it
  * fresh and readers treat `updatedAt` as the source of truth for staleness.
+ *
+ * BAC-1218 guard: if the incoming snapshot is fully empty (no items AND no
+ * lastPunchByClient entries) we refuse to overwrite a recent non-empty
+ * snapshot already in KV. Poster occasionally returns a blank payload for a
+ * single tick (observed during auth blips and their own transient 5xx); the
+ * cron would otherwise wipe the live feed and every SSE listener would see
+ * an empty dashboard for up to 60s.
+ *
+ * The guard only kicks in when ALL of these hold:
+ *   1. New snapshot is empty (items.length === 0 && no lastPunchByClient).
+ *   2. A prior snapshot exists in KV.
+ *   3. Prior snapshot is non-empty.
+ *   4. Prior snapshot's updatedAt is within EMPTY_OVERWRITE_PROTECTION_MS.
+ *
+ * On skip we emit a `captureMessage('empty-poster-response', 'warning')` so
+ * we can track frequency without paging anyone.
  */
 export async function writeSnapshotToKv(
   kv: KVNamespace,
   snapshot: OrdersSnapshot,
 ): Promise<void> {
+  if (isSnapshotEmpty(snapshot)) {
+    const existingRaw = await kv.get(ORDERS_SNAPSHOT_KEY)
+    if (existingRaw) {
+      try {
+        const existing = JSON.parse(existingRaw) as OrdersSnapshot
+        const existingAge =
+          Date.now() - new Date(existing.updatedAt).getTime()
+        if (
+          !isSnapshotEmpty(existing) &&
+          Number.isFinite(existingAge) &&
+          existingAge >= 0 &&
+          existingAge < EMPTY_OVERWRITE_PROTECTION_MS
+        ) {
+          captureMessage('empty-poster-response', {
+            level: 'warning',
+            tags: {
+              subsystem: 'cron',
+              reason: 'skipped-empty-snapshot-overwrite',
+            },
+          })
+          return
+        }
+      } catch {
+        // Malformed KV contents: fall through and overwrite — a corrupt
+        // snapshot is worse than an empty one.
+      }
+    }
+  }
   await kv.put(ORDERS_SNAPSHOT_KEY, JSON.stringify(snapshot))
 }

@@ -4,8 +4,8 @@ class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const resp = await fetch(path, {
+async function request<T>(url: string, options?: RequestInit): Promise<T> {
+  const resp = await fetch(url, {
     ...options,
     credentials: 'same-origin',
     headers: {
@@ -15,8 +15,12 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   })
 
   if (resp.status === 401) {
-    // Trigger re-auth
-    window.dispatchEvent(new CustomEvent('auth:logout'))
+    // Only dashboard-auth routes should kick users to the login screen.
+    // Public /api/v1/* endpoints 401 for missing API keys and shouldn't
+    // affect the dashboard session.
+    if (/^\/(api\/(dashboard|admin|auth)|auth\/)/.test(url)) {
+      window.dispatchEvent(new CustomEvent('auth:logout'))
+    }
     throw new ApiError(401, 'Unauthorized')
   }
 
