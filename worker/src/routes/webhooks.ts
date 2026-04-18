@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import type { Env } from '../env'
 import type { SNSWebhookPayload } from '@shared/types'
-import { MockClockClient } from '../services/clock-mock'
+import { getClockClient } from '../services/clock-factory'
 import { syncGuest } from '../services/guest-sync'
 import { transferInvoice } from '../services/invoice-transfer'
 import { logActivity } from '../db/queries'
@@ -19,8 +19,8 @@ app.post('/clock', async (c) => {
     return c.json({ error: 'Missing booking_id' }, 400)
   }
 
-  // Using mock Clock client until real credentials arrive
-  const clock = new MockClockClient()
+  // Falls back to the mock Clock client until real credentials arrive
+  const clock = getClockClient(c.env)
 
   switch (eventType) {
     case 'booking_new':

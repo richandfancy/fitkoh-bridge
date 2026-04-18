@@ -30,4 +30,9 @@ export interface Env {
   APP_ORIGIN?: string
   // Optional Sentry DSN for Worker error reporting.
   SENTRY_DSN?: string
+  // Clock PMS credentials (optional until Pavel provides them). When
+  // `CLOCK_API_KEY` is unset, `getClockClient()` falls back to the mock
+  // client. See `services/clock-factory.ts`.
+  CLOCK_API_KEY?: string
+  CLOCK_ACCOUNT_ID?: string
 }

@@ -79,6 +79,17 @@ User-facing requests must return in <50ms. Path: Browser → Cloudflare edge →
 - `JWT_SECRET` — For signing bridge JWTs issued to FitKoh users (HS256)
 - `CLOCK_API_USER`, `CLOCK_API_KEY`, `CLOCK_SUBSCRIPTION_ID`, `CLOCK_ACCOUNT_ID` — Clock PMS credentials (when available)
 
+## Going live: DEMO_MODE → real checklist
+
+Before switching Clock PMS + Poster guest sync from mock to real, run through:
+
+1. `guest-sync.ts:7` — set `DEMO_MODE = false`; delete `mockClientId` helper.
+2. `grep -rn "new MockClockClient()" worker/` returns **zero hits** (should all route through `getClockClient()`).
+3. `snsSignatureAuth` middleware in `worker/src/middleware/sns-auth.ts` is the real implementation (not the stub) before removing `dashboardAuth` on `/api/webhooks/*`.
+4. Migration: backfill real `poster_client_id` for bookings created during demo (where `poster_client_id >= 900000` — the deterministic hash range).
+5. Flip `NotificationRecipient` from hardcoded `pavel@fitkoh.app` to an on-call list via `BRIDGE_ALERT_EMAIL` env var.
+6. Smoke-test `POST /api/admin/sync/:id` against a Poster staging account BEFORE accepting the first real SNS webhook.
+
 ## Seed Data (local dev)
 ```bash
 curl -X POST http://localhost:8787/api/admin/seed \

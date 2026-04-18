@@ -10,7 +10,7 @@ import {
   retryDeadLetter,
   resolveDeadLetter,
 } from '../db/queries'
-import { MockClockClient } from '../services/clock-mock'
+import { getClockClient } from '../services/clock-factory'
 import {
   buildOrdersSnapshot,
   readSnapshotFromKv,
@@ -647,7 +647,7 @@ app.put('/config/mappings', async (c) => {
 
 // Config: Clock charge templates (mocked)
 app.get('/config/templates', async (c) => {
-  const clock = new MockClockClient()
+  const clock = getClockClient(c.env)
   const templates = await clock.getChargeTemplates()
   return c.json(templates)
 })

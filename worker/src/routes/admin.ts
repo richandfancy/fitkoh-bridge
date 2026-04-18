@@ -1,7 +1,8 @@
 import { Hono } from 'hono'
 import type { Env } from '../env'
 import type { BridgeEvent, WebhookSubscription } from '@shared/types'
-import { MockClockClient, seedDatabase } from '../services/clock-mock'
+import { seedDatabase } from '../services/clock-mock'
+import { getClockClient } from '../services/clock-factory'
 import { transferInvoice } from '../services/invoice-transfer'
 import { getBookingDetail } from '../db/queries'
 import {
@@ -22,7 +23,7 @@ const app = new Hono<{ Bindings: Env }>()
 // Manual sync trigger
 app.post('/sync/:clockBookingId', async (c) => {
   const bookingId = c.req.param('clockBookingId')
-  const clock = new MockClockClient()
+  const clock = getClockClient(c.env)
   await transferInvoice(c.env, clock, bookingId)
   return c.json({ ok: true, bookingId })
 })
