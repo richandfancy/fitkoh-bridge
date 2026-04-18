@@ -23,6 +23,11 @@ export interface Env {
   // before comparing. Required in production — if unset, request-link will
   // refuse all requests.
   BRIDGE_ADMIN_EMAILS?: string
+  // Canonical origin used to build magic-link callback URLs. Set via
+  // `[vars]` in wrangler.toml so the callback can't be spoofed by crafting
+  // a request with an arbitrary Host header (BAC-1212). Falls back to the
+  // request origin when unset (for `wrangler dev`).
+  APP_ORIGIN?: string
   // Optional Sentry DSN for Worker error reporting.
   SENTRY_DSN?: string
 }
