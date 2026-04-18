@@ -59,13 +59,21 @@ export const ORDERS_SNAPSHOT_KEY = 'live_orders_snapshot'
 export const DEFAULT_SNAPSHOT_MAX_AGE_MS = 90_000
 
 // Poster mixes timestamp formats: dash.getTransactions uses unix-ms strings
-// ("1776400559048"); transactions.getTransactions uses "YYYY-MM-DD HH:MM:SS".
-// Normalize to ISO 8601 for comparison + display.
-function toIso(raw: string | undefined): string | null {
+// ("1776400559048"); transactions.getTransactions uses "YYYY-MM-DD HH:MM:SS";
+// dash.getTransactionHistory.time is also unix-ms. Normalize to ISO 8601 so
+// callers can compare and display without branching per source.
+//
+// Exported for unit tests (BAC-1221). The Poster-date fallback uses a strict
+// date-shape check (`YYYY-MM-DD`) — the older `raw.includes('-')` check was
+// a silent foot-gun that accepted e.g. `"-1"` and returned it verbatim into
+// the sort key. No in-production callers pass negative-number strings, so
+// this is behavior-preserving for real data but closes a silent-bug shape
+// the tests explicitly cover.
+export function toIso(raw: string | undefined): string | null {
   if (!raw || raw === '0') return null
   const ms = Number(raw)
   if (Number.isFinite(ms) && ms > 0) return new Date(ms).toISOString()
-  if (raw.includes('-')) return raw.replace(' ', 'T')
+  if (/^\d{4}-\d{2}-\d{2}/.test(raw)) return raw.replace(' ', 'T')
   return null
 }
 

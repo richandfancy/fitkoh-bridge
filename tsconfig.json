@@ -12,13 +12,22 @@
     "isolatedModules": true,
     "noEmit": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": ["@cloudflare/workers-types", "vite/client"],
+    "types": [
+      "@cloudflare/workers-types",
+      "vite/client",
+      "@cloudflare/vitest-pool-workers/types"
+    ],
     "paths": {
       "@/*": ["./client/src/*"],
       "@shared/*": ["./shared/*"]
     },
     "baseUrl": "."
   },
-  "include": ["client/src/**/*", "shared/**/*", "worker/src/**/*"],
+  "include": [
+    "client/src/**/*",
+    "shared/**/*",
+    "worker/src/**/*",
+    "worker/test-env.d.ts"
+  ],
   "exclude": ["node_modules", "dist"]
 }

@@ -12,7 +12,9 @@
     "deploy:production": "pnpm build && wrangler deploy -c worker/wrangler.toml",
     "db:migrate": "wrangler d1 migrations apply fitkoh-bridge-db --local -c worker/wrangler.toml",
     "db:migrate:remote": "wrangler d1 migrations apply fitkoh-bridge-db --remote -c worker/wrangler.toml",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "cd worker && vitest run",
+    "test:watch": "cd worker && vitest"
   },
   "dependencies": {
     "@hono/zod-openapi": "^1.2.4",
@@ -30,7 +32,8 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260305.0",
+    "@cloudflare/vitest-pool-workers": "^0.14.7",
+    "@cloudflare/workers-types": "^4.20260418.1",
     "@tailwindcss/vite": "^4.2.1",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
@@ -41,6 +44,7 @@
     "tailwindcss": "^4.2.1",
     "typescript": "^5.9.3",
     "vite": "^7.3.1",
+    "vitest": "^4.1.4",
     "wrangler": "^4.68.1"
   },
   "pnpm": {
