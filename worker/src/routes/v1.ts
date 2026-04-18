@@ -5,6 +5,7 @@
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Env } from '../env'
 import { apiKeyAuth, type V1Variables } from '../middleware/api-key'
+import { hasScope } from '../services/api-keys'
 import { getCachedOrFetchMeals } from '../services/meals-cache'
 import { signJwt } from '../services/jwt'
 import { syncUserFromPoster } from '../services/sync-user'
@@ -231,11 +232,38 @@ app.openapi(mealsRoute, async (c) => {
   const { date: queryDate } = c.req.valid('query')
   const date = queryDate || new Date().toISOString().split('T')[0]
 
-  // JWT scope enforcement: a bridge JWT is locked to a single posterClientId
-  // (the `sub` claim). API keys have full access and skip this check.
+  // Access control for cross-user meal reads (BAC-1216 / C5).
+  //
+  // Three valid shapes:
+  //   1. API key with `meals:read:all`     → any guest
+  //   2. API key + JWT, key has `meals:read:all` OR (`meals:read:self` AND
+  //      the JWT's `sub` matches the requested posterClientId)
+  //   3. JWT-only requests are not possible here — `apiKeyAuth` sets either
+  //      `apiKey` or `jwt`, never both without the key path, and the
+  //      middleware already rejects unauthenticated calls.
+  //
+  // API-key-only callers without an accompanying JWT MUST hold
+  // `meals:read:all`. A bare `meals:read:self` key has no subject to pin
+  // against and would otherwise leak data — reject with 403.
   const jwt = c.get('jwt')
+  const scopes = c.get('apiKeyScopes')
+
   if (jwt && jwt.sub !== posterClientId) {
     return c.json({ error: 'JWT is scoped to a different posterClientId' }, 403)
+  }
+
+  if (scopes) {
+    const canReadAll = hasScope(scopes, 'meals:read:all')
+    const canReadSelfForThisGuest =
+      jwt !== undefined &&
+      jwt.sub === posterClientId &&
+      hasScope(scopes, 'meals:read:self')
+    if (!canReadAll && !canReadSelfForThisGuest) {
+      return c.json(
+        { error: 'API key is missing required scope: meals:read:all' },
+        403,
+      )
+    }
   }
 
   try {
@@ -485,6 +513,10 @@ const syncUserRoute = createRoute({
       content: { 'application/json': { schema: ErrorResponseSchema } },
       description: 'Missing or invalid API key',
     },
+    403: {
+      content: { 'application/json': { schema: ErrorResponseSchema } },
+      description: 'Caller lacks required scope or JWT is scoped to a different guest',
+    },
     500: {
       content: { 'application/json': { schema: ErrorResponseSchema } },
       description: 'Upstream (Poster / FitKoh) or bridge error',
@@ -493,7 +525,25 @@ const syncUserRoute = createRoute({
 })
 
 app.openapi(syncUserRoute, async (c) => {
+  // /sync/user writes meal logs into FitKoh on behalf of an arbitrary user.
+  // Require `meals:write` regardless of whether the caller is JWT or
+  // API-key authenticated. JWT callers additionally cannot mint writes for
+  // a different user than their own `sub`.
+  const jwt = c.get('jwt')
+  const scopes = c.get('apiKeyScopes')
   const input = c.req.valid('json')
+
+  if (jwt && jwt.sub !== input.posterClientId) {
+    return c.json({ error: 'JWT is scoped to a different posterClientId' }, 403)
+  }
+
+  if (scopes && !hasScope(scopes, 'meals:write')) {
+    return c.json(
+      { error: 'API key is missing required scope: meals:write' },
+      403,
+    )
+  }
+
   try {
     const result = await syncUserFromPoster(c.env, input)
     return c.json(result, 200)

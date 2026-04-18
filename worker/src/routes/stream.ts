@@ -2,9 +2,12 @@
 //
 // Endpoint: GET /api/v1/stream/orders
 //
-// Auth: the dashboard uses cookie-based auth (bridge_session), external
-// consumers may pass ?api_key=fbk_... as a query param because EventSource
-// cannot send custom headers. We verify either one and then stream.
+// Auth: the dashboard uses cookie-based auth (bridge_session). External
+// (non-browser) consumers pass a short-lived JWT via ?token=... because
+// EventSource cannot send custom headers. Raw API keys (`fbk_...`) are
+// rejected here — they would otherwise land in access logs, browser
+// history, and HTTP Referer headers (BAC-1216 / C4). Mint a JWT via
+// POST /api/v1/auth/token instead.
 //
 // Protocol:
 //   event: snapshot     — first payload, full list of today's items
@@ -18,7 +21,7 @@ import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import { streamSSE } from 'hono/streaming'
 import type { Env } from '../env'
 import { PosterClient } from '../services/poster'
-import { verifyApiKey } from '../services/api-keys'
+import { verifyJwt } from '../services/jwt'
 import { importItemsForUser } from '../services/auto-importer'
 import { verifySessionToken } from '../lib/crypto'
 
@@ -53,13 +56,18 @@ type LiveItem = {
 }
 
 // ---------------------------------------------------------------------------
-// Auth helper: accept cookie OR ?api_key= query param
+// Auth helper: accept dashboard cookie OR a short-lived JWT in the query.
+//
+// Raw API keys (fbk_...) are NOT accepted on this endpoint because query
+// strings appear in Cloudflare access logs, Sentry breadcrumbs, browser
+// history, and HTTP Referer headers. JWTs expire quickly, so even if they
+// leak into a log the blast radius is bounded (BAC-1216 / C4).
 // ---------------------------------------------------------------------------
 
 async function isAuthorized(
   env: Env,
   cookieHeader: string | undefined,
-  queryApiKey: string | undefined,
+  queryToken: string | undefined,
 ): Promise<boolean> {
   const sessionCookie = cookieHeader
     ?.split(';')
@@ -72,9 +80,9 @@ async function isAuthorized(
     if (valid) return true
   }
 
-  if (queryApiKey) {
-    const apiKey = await verifyApiKey(env.DB, queryApiKey)
-    if (apiKey) return true
+  if (queryToken) {
+    const payload = await verifyJwt(env, queryToken)
+    if (payload) return true
   }
 
   return false
@@ -197,29 +205,30 @@ export const streamOrdersRoute = createRoute({
     'A `: heartbeat` comment is emitted every ~16s to keep the connection alive.',
     'The stream self-terminates after 5 minutes; clients should reconnect.',
     '',
-    '**Auth:** pass the dashboard cookie (`bridge_session`) OR `?api_key=fbk_...`',
+    '**Auth:** pass the dashboard cookie (`bridge_session`) OR `?token=<jwt>`',
     'as a query parameter. EventSource cannot send custom headers, so header',
     'auth is not supported on this endpoint.',
     '',
-    'WARNING: Security note: API keys passed via query parameter appear in server logs and browser',
-    'history. For production use, prefer issuing a short-lived JWT via POST /api/v1/auth/token',
-    'and passing it as the api_key parameter instead.',
+    'Raw API keys (`fbk_...`) are REJECTED on this endpoint — query strings',
+    'land in access logs, Sentry breadcrumbs, browser history, and HTTP',
+    'Referer. Issue a short-lived JWT via `POST /api/v1/auth/token` and pass',
+    'it as the `token` parameter instead.',
     '',
     'Example:',
     '```',
-    'curl -N "https://bridge.fitkoh.app/api/v1/stream/orders?api_key=fbk_..."',
+    'curl -N "https://bridge.fitkoh.app/api/v1/stream/orders?token=eyJ..."',
     '```',
   ].join('\n'),
   request: {
     query: z.object({
-      api_key: z
+      token: z
         .string()
         .optional()
         .openapi({
-          param: { name: 'api_key', in: 'query' },
-          example: 'fbk_abc123...',
+          param: { name: 'token', in: 'query' },
+          example: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
           description:
-            'API key (alternative to dashboard cookie). Required for non-browser clients.',
+            'Short-lived bridge JWT (from POST /api/v1/auth/token). Alternative to the dashboard cookie for non-browser clients.',
         }),
     }),
   },
@@ -243,16 +252,36 @@ export const streamOrdersRoute = createRoute({
           schema: z.object({ error: z.string() }),
         },
       },
-      description: 'Missing or invalid cookie / api_key',
+      description:
+        'Missing or invalid credentials. Also returned when a raw API key is passed in the query string.',
     },
   },
 })
 
 app.openapi(streamOrdersRoute, async (c) => {
+  // Reject raw API keys in the query string before attempting auth. The
+  // legacy `?api_key=` param is still read so we can return a clear error
+  // for existing integrations, but anything starting with `fbk_` is always
+  // refused — regardless of whether it would otherwise authenticate.
+  const legacyApiKey = c.req.query('api_key')
+  const queryToken = c.req.query('token')
+  if (
+    (legacyApiKey && legacyApiKey.startsWith('fbk_')) ||
+    (queryToken && queryToken.startsWith('fbk_'))
+  ) {
+    return c.json(
+      {
+        error:
+          'API keys cannot be passed in query strings. Use a short-lived JWT.',
+      },
+      401,
+    )
+  }
+
   const authorized = await isAuthorized(
     c.env,
     c.req.header('cookie'),
-    c.req.query('api_key'),
+    queryToken,
   )
   if (!authorized) {
     return c.json({ error: 'Unauthorized' }, 401)

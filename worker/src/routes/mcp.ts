@@ -14,7 +14,7 @@
 
 import { Hono } from 'hono'
 import type { Env } from '../env'
-import { verifyApiKey } from '../services/api-keys'
+import { verifyApiKey, hasScope, type ApiKey } from '../services/api-keys'
 import {
   getAllBookings,
   getStats,
@@ -156,11 +156,19 @@ function errorBlock(message: string): ToolResult {
 
 async function callTool(
   env: Env,
+  apiKey: ApiKey,
   name: string,
   args: Record<string, unknown>,
 ): Promise<ToolResult> {
   switch (name) {
     case 'get_guest_meals': {
+      // MCP has no JWT path — tool calls always run as the API key itself.
+      // Cross-guest reads therefore require the broad `meals:read:all` scope.
+      if (!hasScope(apiKey.scopes, 'meals:read:all')) {
+        return errorBlock(
+          'API key is missing required scope: meals:read:all',
+        )
+      }
       const posterClientId = Number(args.posterClientId)
       if (!Number.isFinite(posterClientId) || posterClientId <= 0) {
         return errorBlock('posterClientId is required and must be a positive number')
@@ -327,7 +335,7 @@ app.post('/', async (c) => {
             rpcError(id, { code: -32602, message: 'Invalid params: missing tool name' }),
           )
         }
-        const result = await callTool(c.env, name, args)
+        const result = await callTool(c.env, apiKey, name, args)
         return c.json(rpcResult(id, result))
       }
 
