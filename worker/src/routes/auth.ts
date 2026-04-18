@@ -180,6 +180,13 @@ auth.get('/auth/callback', async (c) => {
   // Enforce single-use (BAC-1212). Keyed by the token's HMAC, which is
   // high-entropy and stable. TTL outlives the token itself so a replay after
   // natural expiry still hits the "used" record rather than looking fresh.
+  //
+  // Best-effort, not atomic: KV is eventually consistent (~60s propagation),
+  // so two concurrent callbacks on different colos within the window can both
+  // pass the `used` check and both mint a session. Acceptable — attacker
+  // needs both the token AND to win the race; narrowing from the 15-min
+  // expiry window to ~60s is the meaningful gain. Move to Durable Objects or
+  // a D1 UNIQUE constraint if stricter is ever needed.
   const used = await c.env.CONFIG.get(`auth:used:${verified.hmac}`)
   if (used) return c.redirect(`${origin}/?auth_error=reused`, 302)
   await c.env.CONFIG.put(
