@@ -26,20 +26,20 @@ const auth = new Hono<{ Bindings: Env }>()
 const REQUEST_WINDOW_MS = 15 * 60 * 1000
 const REQUEST_MAX_PER_WINDOW = 5
 
-// In-memory rate-limit map keyed by lowercase email.
-// Reset on Worker cold start — acceptable for a low-volume admin-only route.
-const requestAttempts = new Map<string, number[]>()
-
-function isRateLimited(email: string): boolean {
+// KV-backed rate limiter keyed by lowercase email. Survives Worker cold starts
+// and is consistent across edge colos (eventually — KV is strongly consistent
+// from the perspective of a single key writer).
+async function isRateLimited(env: Env, email: string): Promise<boolean> {
+  const key = `rate:request-link:${email}`
+  const raw = await env.CONFIG.get(key)
   const now = Date.now()
-  const prior = requestAttempts.get(email) ?? []
-  const recent = prior.filter((ts) => now - ts < REQUEST_WINDOW_MS)
-  if (recent.length >= REQUEST_MAX_PER_WINDOW) {
-    requestAttempts.set(email, recent)
-    return true
-  }
+  const priors = raw ? (JSON.parse(raw) as number[]) : []
+  const recent = priors.filter((ts) => now - ts < REQUEST_WINDOW_MS)
+  if (recent.length >= REQUEST_MAX_PER_WINDOW) return true
   recent.push(now)
-  requestAttempts.set(email, recent)
+  await env.CONFIG.put(key, JSON.stringify(recent), {
+    expirationTtl: Math.ceil(REQUEST_WINDOW_MS / 1000),
+  })
   return false
 }
 
@@ -133,7 +133,7 @@ auth.post('/api/auth/request-link', async (c) => {
     return c.json({ ok: false, error: 'invalid_email' }, 400)
   }
 
-  if (isRateLimited(email)) {
+  if (await isRateLimited(c.env, email)) {
     return c.json({ ok: false, error: 'rate_limited' }, 429)
   }
 
