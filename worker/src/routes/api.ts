@@ -1,4 +1,6 @@
 import { Hono } from 'hono'
+import { zValidator } from '@hono/zod-validator'
+import { z } from 'zod'
 import type { Env } from '../env'
 import {
   getStats,
@@ -23,6 +25,113 @@ import type {
   PosterClientGroup,
   UserMatchRow,
 } from '@shared/types'
+
+// BAC-1219 (I13) — Zod input guards for dashboard routes.
+// Dashboard routes are cookie-authed and internal, so we use the lightweight
+// @hono/zod-validator rather than @hono/zod-openapi. On failure every guard
+// returns { error, details } with HTTP 400 for a predictable UI surface.
+
+// Shared error handler for zValidator hooks. Uses `any` for the result param
+// because @hono/zod-validator encodes zod v3/v4 schemas with different ZodError
+// generics, and our per-schema hooks end up with narrow incompatible types.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const zodErrorHook = (result: any, c: any) => {
+  if (!result.success) {
+    return c.json(
+      {
+        error: 'Invalid request',
+        details:
+          typeof result.error?.flatten === 'function'
+            ? result.error.flatten()
+            : result.error?.issues ?? 'validation failed',
+      },
+      400,
+    )
+  }
+}
+
+const PosterClientIdParamSchema = z.object({
+  posterClientId: z.coerce
+    .number({ message: 'posterClientId must be a number' })
+    .int('posterClientId must be an integer')
+    .positive('posterClientId must be positive'),
+})
+
+// Clock booking IDs are numeric strings in our data model. Accepts digits
+// only — anything else is rejected before touching D1.
+const BookingIdParamSchema = z.object({
+  id: z
+    .string()
+    .regex(/^\d+$/, 'id must be a numeric booking id'),
+})
+
+const NumericIdParamSchema = z.object({
+  id: z.coerce
+    .number({ message: 'id must be a number' })
+    .int('id must be an integer')
+    .positive('id must be positive'),
+})
+
+const DateStringSchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'must be a YYYY-MM-DD date')
+
+const PreInvoiceQuerySchema = z.object({
+  dateFrom: DateStringSchema.optional(),
+  dateTo: DateStringSchema.optional(),
+})
+
+const ActivityQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+  type: z.string().min(1).optional(),
+})
+
+const OrdersQuerySchema = z.object({
+  date: DateStringSchema.optional(),
+})
+
+const DeadLettersQuerySchema = z.object({
+  unresolved: z.enum(['true', 'false']).optional(),
+})
+
+const TrimmedString = (max = 200) =>
+  z
+    .string()
+    .transform((s) => s.trim())
+    .pipe(z.string().max(max))
+
+const CreatePosterClientSchema = z
+  .object({
+    groupId: z.coerce
+      .number({ message: 'groupId must be a number' })
+      .int('groupId must be an integer')
+      .positive('groupId must be positive'),
+    firstName: TrimmedString().optional(),
+    lastName: TrimmedString().optional(),
+    patronymic: TrimmedString().optional(),
+    phone: TrimmedString(50).optional(),
+    email: TrimmedString(200).optional(),
+    birthday: TrimmedString(20).optional(),
+    gender: z.coerce.number().int().optional(),
+    cardNumber: TrimmedString(100).optional(),
+    comment: TrimmedString(1000).optional(),
+    country: TrimmedString(100).optional(),
+    city: TrimmedString(100).optional(),
+    address: TrimmedString(500).optional(),
+  })
+  .refine(
+    (v) =>
+      Boolean(
+        (v.firstName && v.firstName.length > 0) ||
+          (v.lastName && v.lastName.length > 0) ||
+          (v.phone && v.phone.length > 0) ||
+          (v.email && v.email.length > 0),
+      ),
+    { message: 'Provide at least a name, phone, or email' },
+  )
+
+const MappingsBodySchema = z.record(z.string(), z.unknown())
 
 // Helper for batched parallel calls (P4 fix — avoids N+1 sequential API calls)
 async function processInBatches<T, R>(
@@ -111,8 +220,8 @@ app.get('/stats', async (c) => {
 //
 // TODO(BAC-1221): integration tests for the KV-hit / KV-miss / historical-date
 // branches and the response-shape contract the frontend depends on.
-app.get('/orders', async (c) => {
-  const date = c.req.query('date') // YYYY-MM-DD optional, defaults to today
+app.get('/orders', zValidator('query', OrdersQuerySchema, zodErrorHook), async (c) => {
+  const { date } = c.req.valid('query')
   const today = new Date().toISOString().split('T')[0]
   const target = date || today
 
@@ -178,64 +287,39 @@ app.get('/poster/client-groups', async (c) => {
 })
 
 // Create a Poster client from the CreateUserDrawer form.
-app.post('/poster/clients', async (c) => {
-  let body: {
-    groupId?: number
-    firstName?: string
-    lastName?: string
-    patronymic?: string
-    phone?: string
-    email?: string
-    birthday?: string
-    gender?: number
-    cardNumber?: string
-    comment?: string
-    country?: string
-    city?: string
-    address?: string
-  } = {}
-  try {
-    body = await c.req.json()
-  } catch {
-    body = {}
-  }
+app.post(
+  '/poster/clients',
+  zValidator('json', CreatePosterClientSchema, zodErrorHook),
+  async (c) => {
+    const body = c.req.valid('json')
+    const firstName = body.firstName ?? ''
+    const lastName = body.lastName ?? ''
+    const phone = body.phone ?? ''
+    const email = body.email ?? ''
 
-  const groupId = Number(body.groupId)
-  if (!Number.isFinite(groupId) || groupId <= 0) {
-    return c.json({ error: 'Group is required' }, 400)
-  }
+    const displayName = `${firstName} ${lastName}`.trim() || phone || email
 
-  const firstName = (body.firstName ?? '').trim()
-  const lastName = (body.lastName ?? '').trim()
-  const phone = (body.phone ?? '').trim()
-  const email = (body.email ?? '').trim()
+    const poster = new PosterClient(c.env.POSTER_ACCESS_TOKEN)
+    const posterClientId = await poster.createClient({
+      client_name: displayName,
+      client_groups_id_client: body.groupId,
+      firstname: firstName || undefined,
+      lastname: lastName || undefined,
+      patronymic: body.patronymic || undefined,
+      phone: phone || undefined,
+      email: email || undefined,
+      birthday: body.birthday || undefined,
+      client_sex: body.gender,
+      card_number: body.cardNumber || undefined,
+      comment: body.comment || undefined,
+      country: body.country || undefined,
+      city: body.city || undefined,
+      address: body.address || undefined,
+    })
 
-  if (!firstName && !lastName && !phone && !email) {
-    return c.json({ error: 'Provide at least a name, phone, or email' }, 400)
-  }
-
-  const displayName = `${firstName} ${lastName}`.trim() || phone || email
-
-  const poster = new PosterClient(c.env.POSTER_ACCESS_TOKEN)
-  const posterClientId = await poster.createClient({
-    client_name: displayName,
-    client_groups_id_client: groupId,
-    firstname: firstName || undefined,
-    lastname: lastName || undefined,
-    patronymic: (body.patronymic ?? '').trim() || undefined,
-    phone: phone || undefined,
-    email: email || undefined,
-    birthday: (body.birthday ?? '').trim() || undefined,
-    client_sex: Number.isFinite(Number(body.gender)) ? Number(body.gender) : undefined,
-    card_number: (body.cardNumber ?? '').trim() || undefined,
-    comment: (body.comment ?? '').trim() || undefined,
-    country: (body.country ?? '').trim() || undefined,
-    city: (body.city ?? '').trim() || undefined,
-    address: (body.address ?? '').trim() || undefined,
-  })
-
-  return c.json({ posterClientId })
-})
+    return c.json({ posterClientId })
+  },
+)
 
 // Cross-system user matching list — populates the Guests tab dashboard with
 // Poster clients, Clock booking names, mapped FitKoh/Rezerv user IDs, and
@@ -492,15 +576,19 @@ app.get('/users', async (c) => {
 })
 
 // Activity log (paginated, filterable)
-app.get('/activity', async (c) => {
-  const limit = Number(c.req.query('limit') || 50)
-  const offset = Number(c.req.query('offset') || 0)
-  const type = c.req.query('type') as
-    | import('@shared/types').ActivityType
-    | undefined
-  const entries = await getActivityLog(c.env.DB, { limit, offset, type })
-  return c.json(entries)
-})
+app.get(
+  '/activity',
+  zValidator('query', ActivityQuerySchema, zodErrorHook),
+  async (c) => {
+    const { limit, offset, type } = c.req.valid('query')
+    const entries = await getActivityLog(c.env.DB, {
+      limit: limit ?? 50,
+      offset: offset ?? 0,
+      type: type as import('@shared/types').ActivityType | undefined,
+    })
+    return c.json(entries)
+  },
+)
 
 // Guests list (all bookings with charge counts + poster sync status)
 app.get('/guests', async (c) => {
@@ -509,16 +597,23 @@ app.get('/guests', async (c) => {
 })
 
 // Guest detail
-app.get('/guests/:id', async (c) => {
-  const id = c.req.param('id')
-  const detail = await getBookingDetail(c.env.DB, id)
-  if (!detail) return c.json({ error: 'Guest not found' }, 404)
-  return c.json(detail)
-})
+app.get(
+  '/guests/:id',
+  zValidator('param', BookingIdParamSchema, zodErrorHook),
+  async (c) => {
+    const { id } = c.req.valid('param')
+    const detail = await getBookingDetail(c.env.DB, id)
+    if (!detail) return c.json({ error: 'Guest not found' }, 404)
+    return c.json(detail)
+  },
+)
 
 // Guest meals from Poster (proxied)
-app.get('/guests/:id/meals', async (c) => {
-  const id = c.req.param('id')
+app.get(
+  '/guests/:id/meals',
+  zValidator('param', BookingIdParamSchema, zodErrorHook),
+  async (c) => {
+  const { id } = c.req.valid('param')
   const booking = await getBooking(c.env.DB, id)
   if (!booking || !booking.poster_client_id) {
     return c.json({ error: 'Guest not found or not synced to Poster' }, 404)
@@ -612,26 +707,40 @@ app.get('/guests/:id/meals', async (c) => {
     days,
     grandTotal: days.reduce((sum, d) => sum + d.total, 0),
   })
-})
+  },
+)
 
 // Dead letters
-app.get('/dead-letters', async (c) => {
-  const unresolvedOnly = c.req.query('unresolved') !== 'false'
-  const letters = await getDeadLetters(c.env.DB, unresolvedOnly)
-  return c.json(letters)
-})
+app.get(
+  '/dead-letters',
+  zValidator('query', DeadLettersQuerySchema, zodErrorHook),
+  async (c) => {
+    const { unresolved } = c.req.valid('query')
+    const unresolvedOnly = unresolved !== 'false'
+    const letters = await getDeadLetters(c.env.DB, unresolvedOnly)
+    return c.json(letters)
+  },
+)
 
-app.post('/dead-letters/:id/retry', async (c) => {
-  const id = Number(c.req.param('id'))
-  await retryDeadLetter(c.env.DB, id)
-  return c.json({ ok: true })
-})
+app.post(
+  '/dead-letters/:id/retry',
+  zValidator('param', NumericIdParamSchema, zodErrorHook),
+  async (c) => {
+    const { id } = c.req.valid('param')
+    await retryDeadLetter(c.env.DB, id)
+    return c.json({ ok: true })
+  },
+)
 
-app.post('/dead-letters/:id/resolve', async (c) => {
-  const id = Number(c.req.param('id'))
-  await resolveDeadLetter(c.env.DB, id)
-  return c.json({ ok: true })
-})
+app.post(
+  '/dead-letters/:id/resolve',
+  zValidator('param', NumericIdParamSchema, zodErrorHook),
+  async (c) => {
+    const { id } = c.req.valid('param')
+    await resolveDeadLetter(c.env.DB, id)
+    return c.json({ ok: true })
+  },
+)
 
 // Config: charge template mappings (KV)
 app.get('/config/mappings', async (c) => {
@@ -639,11 +748,15 @@ app.get('/config/mappings', async (c) => {
   return c.json(raw ? JSON.parse(raw) : {})
 })
 
-app.put('/config/mappings', async (c) => {
-  const body = await c.req.json()
-  await c.env.CONFIG.put('charge_template_mappings', JSON.stringify(body))
-  return c.json({ ok: true })
-})
+app.put(
+  '/config/mappings',
+  zValidator('json', MappingsBodySchema, zodErrorHook),
+  async (c) => {
+    const body = c.req.valid('json')
+    await c.env.CONFIG.put('charge_template_mappings', JSON.stringify(body))
+    return c.json({ ok: true })
+  },
+)
 
 // Config: Clock charge templates (mocked)
 app.get('/config/templates', async (c) => {
@@ -653,12 +766,15 @@ app.get('/config/templates', async (c) => {
 })
 
 // Pre-invoice
-app.get('/pre-invoice/:posterClientId', async (c) => {
-  const posterClientId = Number(c.req.param('posterClientId'))
-  const dateFrom =
-    c.req.query('dateFrom') || '2026-01-01'
-  const dateTo =
-    c.req.query('dateTo') || new Date().toISOString().split('T')[0]
+app.get(
+  '/pre-invoice/:posterClientId',
+  zValidator('param', PosterClientIdParamSchema, zodErrorHook),
+  zValidator('query', PreInvoiceQuerySchema, zodErrorHook),
+  async (c) => {
+  const { posterClientId } = c.req.valid('param')
+  const { dateFrom: queryFrom, dateTo: queryTo } = c.req.valid('query')
+  const dateFrom = queryFrom || '2026-01-01'
+  const dateTo = queryTo || new Date().toISOString().split('T')[0]
 
   const poster = new PosterClient(c.env.POSTER_ACCESS_TOKEN)
 
@@ -778,6 +894,7 @@ app.get('/pre-invoice/:posterClientId', async (c) => {
   }
 
   return c.json(response)
-})
+  },
+)
 
 export default app

@@ -2,6 +2,14 @@
 // Registers /sw.js and dispatches a window event when a new version is waiting
 // so the UI can prompt the user to reload. No auto-reload — admin users may be
 // mid-write.
+//
+// Reload guard (BAC-1219 / I9): `controllerchange` also fires when another tab
+// claims an updated worker, when the user clears site data, or on cold install.
+// Reloading unconditionally would interrupt admins mid-write. We only reload
+// when this tab explicitly asked the waiting worker to skip waiting.
+
+let skipWaitingRequested = false
+let refreshing = false
 
 export function registerServiceWorker(): void {
   if (!('serviceWorker' in navigator)) return
@@ -32,8 +40,8 @@ export function registerServiceWorker(): void {
         console.warn('[sw] registration failed', err)
       })
 
-    let refreshing = false
     navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!skipWaitingRequested) return
       if (refreshing) return
       refreshing = true
       window.location.reload()
@@ -42,5 +50,6 @@ export function registerServiceWorker(): void {
 }
 
 export function applyPendingUpdate(registration: ServiceWorkerRegistration): void {
+  skipWaitingRequested = true
   registration.waiting?.postMessage({ type: 'SKIP_WAITING' })
 }
