@@ -5,6 +5,7 @@ import { captureException, withSentry } from '@sentry/cloudflare'
 import type { Env } from './env'
 import { dashboardAuth } from './middleware/auth'
 import { docsAuth } from './middleware/docs-auth'
+import { snsSignatureAuth } from './middleware/sns-auth'
 import auth from './routes/auth'
 import api from './routes/api'
 import webhooks from './routes/webhooks'
@@ -118,7 +119,11 @@ app.route('/', auth)
 // Webhook routes — gated behind dashboard auth until real Clock PMS integration
 // goes live. When Clock credentials arrive, replace dashboardAuth with SNS
 // signature verification (validate the x-amz-sns-* headers + signing cert).
+// snsSignatureAuth is a stub today (header-shape check only) so the swap at
+// Clock-live time is "remove dashboardAuth" — the real SNS verifier lands in
+// its own ticket and slots in here.
 app.use('/api/webhooks/*', dashboardAuth)
+app.use('/api/webhooks/*', snsSignatureAuth)
 app.route('/api/webhooks', webhooks)
 
 // Dashboard API routes (protected by cookie auth)
