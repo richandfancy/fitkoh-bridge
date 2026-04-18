@@ -5,8 +5,11 @@ import { verifyJwt, type BridgeJwtPayload } from '../services/jwt'
 
 // V1 auth context — a request is either authenticated via an API key OR a
 // bridge JWT. Downstream handlers can inspect both to decide scope/access.
+// `apiKeyScopes` is set whenever an API key authenticated the request, so
+// handlers can gate behavior with `hasScope()` without re-reading the row.
 export type V1Variables = {
   apiKey?: ApiKey
+  apiKeyScopes?: string[]
   jwt?: BridgeJwtPayload
 }
 
@@ -51,5 +54,6 @@ export const apiKeyAuth = createMiddleware<{
   }
 
   c.set('apiKey', apiKey)
+  c.set('apiKeyScopes', apiKey.scopes)
   await next()
 })

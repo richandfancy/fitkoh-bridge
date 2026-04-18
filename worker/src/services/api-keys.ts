@@ -7,6 +7,55 @@ export interface ApiKey {
   created_at: string
   last_used_at: string | null
   revoked_at: string | null
+  scopes: string[]
+}
+
+// Raw DB row shape for api_keys — `scopes` is stored as a JSON string.
+interface ApiKeyRow {
+  id: number
+  name: string
+  key_prefix: string
+  created_at: string
+  last_used_at: string | null
+  revoked_at: string | null
+  scopes: string | null
+}
+
+// Fallback scopes for rows predating migration 0006 or written with a
+// malformed scopes blob. Matches the migration's column default so legacy
+// keys keep the same "full access" behavior they had before scopes existed.
+const LEGACY_FULL_SCOPES: string[] = ['meals:read:all', 'meals:write']
+
+function parseScopes(raw: string | null): string[] {
+  if (!raw) return LEGACY_FULL_SCOPES
+  try {
+    const parsed = JSON.parse(raw)
+    if (Array.isArray(parsed) && parsed.every((s) => typeof s === 'string')) {
+      return parsed
+    }
+  } catch {
+    // fall through
+  }
+  return LEGACY_FULL_SCOPES
+}
+
+/**
+ * Check whether a scope list satisfies a required scope.
+ *
+ * A `:all` scope is treated as a wildcard for its resource+action pair — so
+ * `meals:read:all` satisfies both `meals:read:all` and `meals:read:self`.
+ * Exact matches always pass.
+ */
+export function hasScope(scopes: string[], required: string): boolean {
+  if (scopes.includes(required)) return true
+
+  const parts = required.split(':')
+  // Only apply the wildcard rule when the required scope is of the form
+  // "{resource}:{action}:{target}" — otherwise there's no `:all` variant.
+  if (parts.length !== 3) return false
+
+  const wildcard = `${parts[0]}:${parts[1]}:all`
+  return scopes.includes(wildcard)
 }
 
 // Hash a key using Web Crypto SHA-256 (Workers compatible)
@@ -51,10 +100,18 @@ export async function createApiKey(
 export async function listApiKeys(db: D1Database): Promise<ApiKey[]> {
   const result = await db
     .prepare(
-      'SELECT id, name, key_prefix, created_at, last_used_at, revoked_at FROM api_keys ORDER BY created_at DESC',
+      'SELECT id, name, key_prefix, created_at, last_used_at, revoked_at, scopes FROM api_keys ORDER BY created_at DESC',
     )
-    .all<ApiKey>()
-  return result.results
+    .all<ApiKeyRow>()
+  return result.results.map((row) => ({
+    id: row.id,
+    name: row.name,
+    key_prefix: row.key_prefix,
+    created_at: row.created_at,
+    last_used_at: row.last_used_at,
+    revoked_at: row.revoked_at,
+    scopes: parseScopes(row.scopes),
+  }))
 }
 
 export async function verifyApiKey(
@@ -64,10 +121,10 @@ export async function verifyApiKey(
   const hashed = await hashKey(rawKey)
   const row = await db
     .prepare(
-      'SELECT id, name, key_prefix, created_at, last_used_at, revoked_at FROM api_keys WHERE hashed_key = ? AND revoked_at IS NULL',
+      'SELECT id, name, key_prefix, created_at, last_used_at, revoked_at, scopes FROM api_keys WHERE hashed_key = ? AND revoked_at IS NULL',
     )
     .bind(hashed)
-    .first<ApiKey>()
+    .first<ApiKeyRow>()
 
   if (!row) return null
 
@@ -77,7 +134,15 @@ export async function verifyApiKey(
     .bind(row.id)
     .run()
 
-  return row
+  return {
+    id: row.id,
+    name: row.name,
+    key_prefix: row.key_prefix,
+    created_at: row.created_at,
+    last_used_at: row.last_used_at,
+    revoked_at: row.revoked_at,
+    scopes: parseScopes(row.scopes),
+  }
 }
 
 export async function revokeApiKey(
