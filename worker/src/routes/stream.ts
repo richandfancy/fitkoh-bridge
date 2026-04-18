@@ -17,6 +17,11 @@
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import { streamSSE } from 'hono/streaming'
 import type { Env } from '../env'
+import {
+  buildOrdersSnapshot,
+  readSnapshotFromKv,
+  type LiveOrderItem,
+} from '../services/orders-feed'
 import { PosterClient } from '../services/poster'
 import { verifyApiKey } from '../services/api-keys'
 import { importItemsForUser } from '../services/auto-importer'
@@ -38,19 +43,9 @@ const HEARTBEAT_EVERY_TICKS = 8
 // Types
 // ---------------------------------------------------------------------------
 
-type LiveItem = {
-  id: string
-  time: string
-  productId: number
-  productName: string
-  quantity: number
-  price: number
-  table: number
-  location: string
-  clientName: string | null
-  clientId: number | null
-  transactionId: number
-}
+// Item shape matches the KV snapshot written by orders-feed.ts. Re-aliased
+// here so the SSE protocol contract is documented next to the stream code.
+type LiveItem = LiveOrderItem
 
 // ---------------------------------------------------------------------------
 // Auth helper: accept cookie OR ?api_key= query param
@@ -86,93 +81,24 @@ async function isAuthorized(
 // Reads from the KV `live_orders_snapshot` that the cron warms every 60s.
 // Falls back to a live Poster fetch only if KV is stale (>90s) or missing.
 // This reduces Poster API calls from 90/min per SSE client to 3/min total.
+//
+// Both paths run through orders-feed so the SSE protocol shape stays
+// lock-step with the cron output and the /api/dashboard/orders contract.
+//
+// TODO(BAC-1221): SSE integration test covering snapshot vs. delta emission
+// and reconnect behavior when KV and Poster both fail.
 // ---------------------------------------------------------------------------
 
-// Max age (ms) before the KV snapshot is considered stale.
-const SNAPSHOT_MAX_AGE_MS = 90_000
-
 async function fetchTodayItems(env: Env): Promise<LiveItem[]> {
-  // Try KV snapshot first (populated by cron every 60s)
-  try {
-    const raw = await env.CONFIG.get('live_orders_snapshot')
-    if (raw) {
-      const data = JSON.parse(raw) as { items: LiveItem[]; updatedAt: string }
-      const age = Date.now() - new Date(data.updatedAt).getTime()
-      if (age < SNAPSHOT_MAX_AGE_MS) {
-        return data.items
-      }
-    }
-  } catch {
-    // KV read failed — fall through to live fetch
-  }
-
-  // Fallback: live Poster fetch (only if KV is stale or missing)
-  return fetchTodayItemsLive(env)
-}
-
-async function fetchTodayItemsLive(env: Env): Promise<LiveItem[]> {
-  const poster = new PosterClient(env.POSTER_ACCESS_TOKEN)
   const today = new Date().toISOString().split('T')[0]
 
-  const [detailed, products, dashTxns] = await Promise.all([
-    poster.getDetailedTransactions(today, today, 500),
-    poster.getProducts(),
-    poster.getTransactions(today.replace(/-/g, ''), today.replace(/-/g, '')),
-  ])
+  const snapshot = await readSnapshotFromKv(env.CONFIG, { today })
+  if (snapshot) return snapshot.items
 
-  const productMap = new Map(
-    products.map((p) => [
-      String(p.product_id),
-      (p.product_name || '').replace(/^food_/, ''),
-    ]),
-  )
-
-  const clientNames = new Map<string, string>()
-  const spotNames = new Map<string, string>()
-  const dashArr = Array.isArray(dashTxns) ? dashTxns : []
-  for (const t of dashArr) {
-    if (
-      t.client_id &&
-      t.client_id !== '0' &&
-      (t.client_firstname || t.client_lastname)
-    ) {
-      clientNames.set(
-        t.client_id,
-        `${t.client_lastname || ''} ${t.client_firstname || ''}`.trim(),
-      )
-    }
-    if (t.spot_id && t.name) {
-      spotNames.set(String(t.spot_id), t.name.trim())
-    }
-  }
-
-  const items: LiveItem[] = []
-  for (const t of detailed) {
-    const location = spotNames.get(String(t.spot_id)) || 'Unknown'
-    const clientName = clientNames.get(String(t.client_id)) || null
-
-    for (let i = 0; i < (t.products || []).length; i++) {
-      const p = t.products[i]
-      const productIdStr = String(p.product_id)
-      items.push({
-        id: `${t.transaction_id}-${i}`,
-        time: t.date_close,
-        productId: p.product_id,
-        productName: productMap.get(productIdStr) || `Product #${productIdStr}`,
-        quantity: Number(p.num || 1),
-        price: Number(p.product_sum || 0),
-        table: t.table_id,
-        location,
-        clientName,
-        clientId: t.client_id || null,
-        transactionId: t.transaction_id,
-      })
-    }
-  }
-
-  // Chronological (oldest first) so consumers see events in order
-  items.sort((a, b) => a.time.localeCompare(b.time))
-  return items
+  // Fallback: live Poster build (only if KV is stale or missing).
+  const poster = new PosterClient(env.POSTER_ACCESS_TOKEN)
+  const built = await buildOrdersSnapshot(poster, { today })
+  return built.items
 }
 
 // ---------------------------------------------------------------------------

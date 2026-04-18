@@ -13,6 +13,7 @@
 
 import type { Env } from '../env'
 import { fetchMealsForClient } from './meals-cache'
+import { buildOrdersSnapshot, writeSnapshotToKv } from './orders-feed'
 import { PosterClient } from './poster'
 
 const CONCURRENCY = 5
@@ -99,182 +100,14 @@ export async function warmMealsCache(env: Env): Promise<{
  * endpoint can read from KV (~5ms) instead of hitting Poster directly (3 API
  * calls). This reduces Poster API usage from 90 calls/min per SSE client to
  * 3 calls/min total regardless of how many clients are connected.
+ *
+ * Thin wrapper around orders-feed — the build/write logic lives there so the
+ * /api/dashboard/orders fallback and SSE fetchTodayItemsLive can share it.
  */
 export async function warmOrdersSnapshot(env: Env): Promise<void> {
   const poster = new PosterClient(env.POSTER_ACCESS_TOKEN)
   const today = new Date().toISOString().split('T')[0]
 
-  const [detailed, products, dashTxns] = await Promise.all([
-    poster.getDetailedTransactions(today, today, 500),
-    poster.getProducts(),
-    poster.getTransactions(
-      today.replace(/-/g, ''),
-      today.replace(/-/g, ''),
-    ),
-  ])
-
-  const productMap = new Map(
-    products.map((p) => [
-      String(p.product_id),
-      (p.product_name || '').replace(/^food_/, ''),
-    ]),
-  )
-
-  const clientNames = new Map<string, string>()
-  const spotNames = new Map<string, string>()
-  // transactions.getTransactions (detailed) returns client_id=0 for most
-  // rows, so we can't use it to attribute punches to clients directly.
-  // dash.getTransactions does carry the real client_id — build a
-  // transaction_id → client_id map so each detailed row can be attributed.
-  const clientIdByTxn = new Map<number, string>()
-  const dashArr = Array.isArray(dashTxns) ? dashTxns : []
-
-  // Poster mixes timestamp formats: dash.getTransactions uses unix-ms
-  // strings ("1776400559048"); transactions.getTransactions uses
-  // "YYYY-MM-DD HH:MM:SS". Normalize to ISO 8601 for comparison + display.
-  function toIso(raw: string | undefined): string | null {
-    if (!raw || raw === '0') return null
-    const ms = Number(raw)
-    if (Number.isFinite(ms) && ms > 0) return new Date(ms).toISOString()
-    if (raw.includes('-')) return raw.replace(' ', 'T')
-    return null
-  }
-
-  for (const t of dashArr) {
-    if (
-      t.client_id &&
-      t.client_id !== '0' &&
-      (t.client_firstname || t.client_lastname)
-    ) {
-      clientNames.set(
-        t.client_id,
-        `${t.client_lastname || ''} ${t.client_firstname || ''}`.trim(),
-      )
-    }
-    if (t.spot_id && t.name) {
-      spotNames.set(String(t.spot_id), t.name.trim())
-    }
-    if (t.client_id && t.client_id !== '0' && t.transaction_id) {
-      clientIdByTxn.set(Number(t.transaction_id), t.client_id)
-    }
-  }
-
-  // Last punch per client (BAC-1149).
-  //
-  // For CLOSED transactions, `date_close` from the detailed feed is the real
-  // close timestamp — static and correct.
-  //
-  // For OPEN transactions we need true per-item punch time. Poster's
-  // `transactions.getTransactions.date_close` happens to move on punch events
-  // but the name is misleading and the contract isn't documented. The
-  // authoritative source is `dash.getTransactionHistory(txnId)` which returns
-  // a per-event log (`additem`, `open`, `close`, `sign`, …) with unix-ms
-  // timestamps. We take max(event.time) across all entries so any activity
-  // counts as a punch.
-  //
-  // Cost: +1 Poster call per open transaction per cron tick (~30/min at
-  // peak). Well under the API budget.
-  const lastPunchByClient: Record<string, string> = {}
-
-  for (const t of detailed) {
-    const clientIdStr = clientIdByTxn.get(t.transaction_id)
-    if (!clientIdStr) continue
-    const iso = toIso(t.date_close)
-    if (!iso) continue
-    const prior = lastPunchByClient[clientIdStr]
-    if (!prior || iso > prior) {
-      lastPunchByClient[clientIdStr] = iso
-    }
-  }
-
-  const openTxnsWithClients: Array<{ transactionId: number; clientId: string }> = []
-  for (const t of dashArr) {
-    if (t.status !== '1') continue
-    if (!t.client_id || t.client_id === '0') continue
-    if (!t.transaction_id) continue
-    openTxnsWithClients.push({
-      transactionId: Number(t.transaction_id),
-      clientId: t.client_id,
-    })
-  }
-
-  const HISTORY_CONCURRENCY = 5
-  const historyResults = await processInBatches(
-    openTxnsWithClients,
-    HISTORY_CONCURRENCY,
-    async ({ transactionId, clientId }) => {
-      const history = await poster.getTransactionHistory(String(transactionId))
-      let maxMs = 0
-      for (const ev of history || []) {
-        const ms = Number(ev.time)
-        if (Number.isFinite(ms) && ms > maxMs) maxMs = ms
-      }
-      return { clientId, maxMs }
-    },
-  )
-  for (const r of historyResults) {
-    if (!r.ok) continue
-    const { clientId, maxMs } = r.value
-    if (!maxMs) continue
-    const iso = new Date(maxMs).toISOString()
-    const prior = lastPunchByClient[clientId]
-    if (!prior || iso > prior) {
-      lastPunchByClient[clientId] = iso
-    }
-  }
-
-  const items: Array<{
-    id: string
-    time: string
-    productId: number
-    productName: string
-    quantity: number
-    price: number
-    table: number
-    location: string
-    clientName: string | null
-    clientId: number | null
-    transactionId: number
-  }> = []
-
-  for (const t of detailed) {
-    const location = spotNames.get(String(t.spot_id)) || 'Unknown'
-    const clientName = clientNames.get(String(t.client_id)) || null
-
-    for (let i = 0; i < (t.products || []).length; i++) {
-      const p = t.products[i]
-      const productIdStr = String(p.product_id)
-      items.push({
-        id: `${t.transaction_id}-${i}`,
-        time: t.date_close,
-        productId: p.product_id,
-        productName:
-          productMap.get(productIdStr) || `Product #${productIdStr}`,
-        quantity: Number(p.num || 1),
-        price: Number(p.product_sum || 0),
-        table: t.table_id,
-        location,
-        clientName,
-        clientId: t.client_id || null,
-        transactionId: t.transaction_id,
-      })
-    }
-  }
-
-  items.sort((a, b) => a.time.localeCompare(b.time))
-
-  await env.CONFIG.put(
-    'live_orders_snapshot',
-    JSON.stringify({
-      date: today,
-      items,
-      updatedAt: new Date().toISOString(),
-      openOrders: dashArr.filter((t) => t.status === '1').length,
-      closedOrders: dashArr.filter((t) => t.status === '2').length,
-      lastPunchByClient,
-      // Keep the old key around for one deploy so the /users endpoint can
-      // roll over without a blank "Last Punch" column during the transition.
-      lastOrderByClient: lastPunchByClient,
-    }),
-  )
+  const snapshot = await buildOrdersSnapshot(poster, { today })
+  await writeSnapshotToKv(env.CONFIG, snapshot)
 }
