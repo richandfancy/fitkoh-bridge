@@ -515,7 +515,7 @@ const syncUserRoute = createRoute({
     },
     403: {
       content: { 'application/json': { schema: ErrorResponseSchema } },
-      description: 'Caller lacks required scope or JWT is scoped to a different guest',
+      description: 'JWT auth not allowed on this service endpoint, or API key lacks meals:write scope',
     },
     500: {
       content: { 'application/json': { schema: ErrorResponseSchema } },
@@ -525,25 +525,27 @@ const syncUserRoute = createRoute({
 })
 
 app.openapi(syncUserRoute, async (c) => {
-  // /sync/user writes meal logs into FitKoh on behalf of an arbitrary user.
-  // Require `meals:write` regardless of whether the caller is JWT or
-  // API-key authenticated. JWT callers additionally cannot mint writes for
-  // a different user than their own `sub`.
-  const jwt = c.get('jwt')
-  const scopes = c.get('apiKeyScopes')
-  const input = c.req.valid('json')
-
-  if (jwt && jwt.sub !== input.posterClientId) {
-    return c.json({ error: 'JWT is scoped to a different posterClientId' }, 403)
+  // /sync/user is a server-to-server endpoint: the FitKoh backend calls it
+  // with a service API key scoped `meals:write`. JWT callers (browser-minted
+  // via /auth/token) are rejected outright — their hardcoded `meals:read`
+  // scope would otherwise bypass the scope check entirely.
+  const apiKey = c.get('apiKey')
+  if (!apiKey) {
+    return c.json(
+      { error: 'Service endpoint. API key required.', code: 'jwt_not_allowed' },
+      403,
+    )
   }
 
-  if (scopes && !hasScope(scopes, 'meals:write')) {
+  const scopes = c.get('apiKeyScopes')
+  if (!scopes || !hasScope(scopes, 'meals:write')) {
     return c.json(
       { error: 'API key is missing required scope: meals:write' },
       403,
     )
   }
 
+  const input = c.req.valid('json')
   try {
     const result = await syncUserFromPoster(c.env, input)
     return c.json(result, 200)
